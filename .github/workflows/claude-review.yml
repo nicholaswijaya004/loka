@@ -30,9 +30,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 <<<<<<< HEAD
+<<<<<<< HEAD
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 =======
 >>>>>>> 377f9de (ci: add claude review and interactive workflows)
+=======
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+>>>>>>> 78e3222 (adding anthropic API key as part of authorization)
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
