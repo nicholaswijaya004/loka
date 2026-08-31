@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+echo "→ gofmt"
+test -z "$(gofmt -l .)" || { gofmt -l .; echo "run: gofmt -w ."; exit 1; }
+echo "→ go vet"
+go vet ./...
