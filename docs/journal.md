@@ -79,3 +79,15 @@ as Day 2's UnsafeInventory, now at database scale.
 - bookings created vs seats actually sold: ___
 Unlike Day 2, available_units cannot go negative — the CHECK constraint
 blocks it. So I expect failures rather than corruption.
+
+### Day 5 — Concurrency baseline (500 VUs, 10 seats, pool=50)
+
+| Strategy | Bookings | available_units | Invariant | Overbooked |
+|---|---|---|---|---|
+| `SET available = available - $1` (SQL) | 10 | 0 | 0+10=10 ✓ | 0 |
+| `SET available = $1` (Go-computed) | 500 | 8 | 8+500=508 ✗ | 490 |
+
+Both run against identical code paths apart from one SQL statement.
+The CHECK constraint fired 490 times in the safe run and zero times in
+the unsafe run — an out-of-date value written absolutely stays within
+legal bounds, so the constraint has nothing to reject.

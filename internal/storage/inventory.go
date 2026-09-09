@@ -61,3 +61,24 @@ func (s *Store) DecrementAvailability(ctx context.Context, id uuid.UUID, qty int
 	}
 	return nil
 }
+
+// DecrementAvailabilityUnsafe writes an absolute value computed by the caller
+// from a previously-read availability. This deliberately trusts a stale read
+// and is retained only to demonstrate the lost-update anomaly under load.
+// Production paths must use DecrementAvailability.
+func (s *Store) DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error {
+	var pgErr *pgconn.PgError
+	tag, err := s.db.Exec(ctx, `
+		UPDATE inventory_units SET available_units = $1 WHERE unit_id = $2
+	`, newAvailable, id)
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "chk_availability" {
+		return ErrSoldOut
+	}
+	if err != nil {
+		return fmt.Errorf("decrement availability: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUnitNotFound
+	}
+	return nil
+}
