@@ -44,6 +44,12 @@ func (f *fakeStore) DecrementAvailability(ctx context.Context, id uuid.UUID, qty
 	return f.decErr
 }
 
+func (f *fakeStore) DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error {
+	f.decCalls++
+	f.decUnitID = id
+	return f.decErr
+}
+
 func (f *fakeStore) InsertBooking(ctx context.Context, b *storage.Booking) error {
 	f.insCalls++
 	if f.insErr != nil {
@@ -230,7 +236,7 @@ func TestServiceCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(tt.store)
+			svc := NewService(tt.store, false)
 
 			got, err := svc.Create(context.Background(), testUnitID, testCustomerID, tt.qty, testVisit)
 
@@ -262,7 +268,7 @@ func TestServiceCreate(t *testing.T) {
 
 func TestServiceCreateBuildsBookingCorrectly(t *testing.T) {
 	store := &fakeStore{unit: testUnit(10, 10, 1)}
-	svc := NewService(store)
+	svc := NewService(store, false)
 
 	const qty = 3
 
@@ -305,7 +311,7 @@ func TestServiceCreateBuildsBookingCorrectly(t *testing.T) {
 
 func TestServiceCreatePassesQuantityToStore(t *testing.T) {
 	store := &fakeStore{unit: testUnit(10, 10, 1)}
-	svc := NewService(store)
+	svc := NewService(store, false)
 
 	const qty = 4
 
@@ -358,7 +364,7 @@ func TestServiceGet(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(tt.store)
+			svc := NewService(tt.store, false)
 
 			got, err := svc.Get(context.Background(), bookingID)
 

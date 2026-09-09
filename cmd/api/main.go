@@ -28,7 +28,14 @@ func main() {
 		dsn = "postgres://loka:loka@localhost:5432/loka?sslmode=disable"
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		logger.Error("bad dsn", "error", err)
+		os.Exit(1)
+	}
+	cfg.MaxConns = 50
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		logger.Error("db pool init failed", "error", err)
 		os.Exit(1)
@@ -43,7 +50,11 @@ func main() {
 	}
 
 	store := storage.NewStore(pool)
-	svc := booking.NewService(store)
+	unsafe := os.Getenv("UNSAFE_DECREMENT") == "1"
+	svc := booking.NewService(store, unsafe)
+	if unsafe {
+		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
+	}
 	h := api.NewHandler(svc, logger)
 
 	mux := http.NewServeMux()

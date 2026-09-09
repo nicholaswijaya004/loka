@@ -9,16 +9,18 @@ import (
 )
 
 type Service struct {
-	store Store
+	store  Store
+	unsafe bool
 }
 
-func NewService(store Store) *Service {
-	return &Service{store: store}
+func NewService(store Store, unsafe bool) *Service {
+	return &Service{store: store, unsafe: unsafe}
 }
 
 type Store interface {
 	GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
 	DecrementAvailability(ctx context.Context, id uuid.UUID, qty int) error
+	DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error
 	InsertBooking(ctx context.Context, b *storage.Booking) error
 	GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error)
 }
@@ -39,7 +41,12 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 		return nil, ErrSoldOut
 	}
 
-	err = s.store.DecrementAvailability(ctx, unitID, qty)
+	if s.unsafe {
+		err = s.store.DecrementAvailabilityUnsafe(ctx, unitID, unit.AvailableUnits-qty)
+	} else {
+		err = s.store.DecrementAvailability(ctx, unitID, qty)
+	}
+
 	if errors.Is(err, storage.ErrSoldOut) {
 		return nil, ErrSoldOut
 	}
