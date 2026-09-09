@@ -62,3 +62,20 @@ loka=# UPDATE inventory_units SET available_units = 50;
 ERROR:  new row for relation "inventory_units" violates check constraint "chk_availability"
 DETAIL:  Failing row contains (4f5cc513-9559-4c95-880e-2579c910942e, Deluxe Cabin, null, 50, 10, IDR, 150000000, 1, 2026-09-07 16:15:54.910336+00, 2026-09-07 16:15:54.910336+00, 0).
 ```
+
+## Day 4 — <date>
+Built the naive booking endpoint. Sequential behaviour is fully correct:
+201 with computed total, availability 10 → 9, 409 when sold out, 404 on
+unknown unit, 400 on bad input.
+
+The flow is deliberately unsafe — four separate round trips, no transaction:
+  GetInventoryUnit → check availability → DecrementAvailability → InsertBooking
+The gap between the check and the decrement is the same check-then-act race
+as Day 2's UnsafeInventory, now at database scale.
+
+**Prediction for Day 5** (500 concurrent requests against the 1-seat unit):
+- successful bookings: ___
+- constraint violations from chk_availability: ___
+- bookings created vs seats actually sold: ___
+Unlike Day 2, available_units cannot go negative — the CHECK constraint
+blocks it. So I expect failures rather than corruption.

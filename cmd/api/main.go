@@ -9,6 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nicholaswijaya004/loka/internal/api"
+	"github.com/nicholaswijaya004/loka/internal/booking"
+	"github.com/nicholaswijaya004/loka/internal/storage"
 )
 
 func main() {
@@ -17,7 +23,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://loka:loka@localhost:5432/loka?sslmode=disable"
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		logger.Error("db pool init failed", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelPing()
+	if err := pool.Ping(pingCtx); err != nil {
+		logger.Error("db unreachable", "error", err)
+		os.Exit(1)
+	}
+
+	store := storage.NewStore(pool)
+	svc := booking.NewService(store)
+	h := api.NewHandler(svc, logger)
+
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -25,6 +55,26 @@ func main() {
 			logger.Error("write failed", "path", r.URL.Path, "error", err)
 		}
 	})
+
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		rctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if err := pool.Ping(rctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, err := w.Write([]byte(`{"status":"db unavailable"}`)); err != nil {
+				logger.Error("write failed", "path", r.URL.Path, "error", err)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ready"}`)); err != nil {
+			logger.Error("write failed", "path", r.URL.Path, "error", err)
+		}
+	})
+
+	mux.HandleFunc("POST /bookings", h.CreateBooking)
+	mux.HandleFunc("GET /bookings/{id}", h.GetBooking)
 
 	srv := &http.Server{
 		Addr:         ":8080",
