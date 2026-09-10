@@ -5,16 +5,18 @@ import (
 	"errors"
 	"github.com/google/uuid"
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"log/slog"
 	"time"
 )
 
 type Service struct {
 	store  Store
+	logger *slog.Logger
 	unsafe bool
 }
 
-func NewService(store Store, unsafe bool) *Service {
-	return &Service{store: store, unsafe: unsafe}
+func NewService(store Store, logger *slog.Logger, unsafe bool) *Service {
+	return &Service{store: store, logger: logger, unsafe: unsafe}
 }
 
 type Store interface {
@@ -23,6 +25,10 @@ type Store interface {
 	DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error
 	InsertBooking(ctx context.Context, b *storage.Booking) error
 	GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error)
+	ClaimIdempotencyKey(ctx context.Context, key, requestHash string) (bool, error)
+	GetIdempotencyKey(ctx context.Context, key string) (*storage.IdempotencyKey, error)
+	CompleteIdempotencyKey(ctx context.Context, key string, bookingID uuid.UUID, responseStatus int, responseBody []byte) error
+	ReleaseIdempotencyKey(ctx context.Context, key string) error
 }
 
 func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {

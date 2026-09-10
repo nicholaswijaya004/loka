@@ -91,3 +91,30 @@ Both run against identical code paths apart from one SQL statement.
 The CHECK constraint fired 490 times in the safe run and zero times in
 the unsafe run — an out-of-date value written absolutely stays within
 legal bounds, so the constraint has nothing to reject.
+
+## Day 6 — Idempotency
+
+**Before:**
+| | Sequential (2 identical requests) | Concurrent (500 VUs, one key) |
+|---|---|---|
+| bookings | 2 | 10 |
+| available_units | 10 → 8 | 10 → 0 |
+
+**After:**
+| | Sequential | Concurrent |
+|---|---|---|
+| bookings | 1 | 1 |
+| available_units | 10 → 9 | 10 → 9 |
+| retry response | 200 + Idempotent-Replay, same booking id | 409 in-flight |
+
+500 concurrent retries of one request now consume exactly one seat.
+
+**Mechanism:** the claim is an INSERT, not a SELECT-then-INSERT. Postgres'
+primary key lets exactly one through; the other 499 receive SQLSTATE 23505
+and learn they lost. No application-level coordination is involved — the
+same property that made the CHECK constraint hold on day 5.
+
+**Split observed:** 499 conflicts, 0 replays — the winner was still in
+flight when the burst arrived. The sequential test covers the replay path.
+
+Service package coverage: 100% of statements.

@@ -2,17 +2,25 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 )
 
-func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, []byte, bool) {
 	var v T
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
-		writeError(w, 400, "invalid JSON")
-		return v, false
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return v, nil, false
 	}
-	return v, true
+
+	if err := json.Unmarshal(body, &v); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return v, nil, false
+	}
+
+	return v, body, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

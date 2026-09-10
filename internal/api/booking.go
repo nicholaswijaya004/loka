@@ -41,8 +41,20 @@ func toResponse(b *storage.Booking) bookingResponse {
 }
 
 func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
-	req, ok := decodeJSON[createBookingRequest](w, r)
+	req, body, ok := decodeJSON[createBookingRequest](w, r)
 	if !ok {
+		return
+	}
+
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
+	hash, err := hashRequest(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 
@@ -58,7 +70,7 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := h.svc.Create(r.Context(), unitID, customerID, req.Qty, req.VisitDateTime)
+	b, replayed, err := h.svc.CreateIdempotent(r.Context(), key, hash, unitID, customerID, req.Qty, req.VisitDateTime)
 	if err != nil {
 		status, msg := errorResponse(err)
 		if status == http.StatusInternalServerError {
@@ -68,7 +80,13 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toResponse(b))
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+
+	writeJSON(w, status, toResponse(b))
 }
 
 func (h *Handler) GetBooking(w http.ResponseWriter, r *http.Request) {
