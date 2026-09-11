@@ -23,6 +23,10 @@ func errorResponse(err error) (int, string) {
 		return http.StatusNotFound, "booking not found"
 	case errors.Is(err, booking.ErrSoldOut):
 		return http.StatusConflict, "sold out"
+	case errors.Is(err, booking.ErrKeyReused):
+		return http.StatusUnprocessableEntity, "idempotency key reused with a different request"
+	case errors.Is(err, booking.ErrRequestInFlight):
+		return http.StatusConflict, "a request with this idempotency key is in progress"
 	default:
 		return http.StatusInternalServerError, "internal error"
 	}
