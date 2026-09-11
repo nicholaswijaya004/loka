@@ -221,8 +221,6 @@ Week 4 chaos test does exactly that.
 
 ## Decision 4 — Optimistic concurrency control via a `version` column
 
-*Revised 2026-09-11 in light of the day 5 measurements.*
-
 `inventory_units` carries a `version integer`, incremented on every update.
 Writes take the form:
 
@@ -242,27 +240,12 @@ transaction.
 **Chosen:** both are implemented, because the point of this project is to
 measure the difference rather than assert it.
 
-**Original hypothesis.** Optimistic locking wins at low contention, pessimistic
-at high, with correctness as the thing being bought.
-
-**What measurement showed.** The correctness premise was wrong. A single-statement
-`UPDATE ... SET available_units = available_units - $1` combined with
-`CHECK (available_units >= 0)` already prevents overselling entirely: 500
-concurrent requests against 10 seats produced exactly 10 bookings. Postgres
-evaluates the subtraction against the current committed value under a row lock,
-so a stale application-side read cannot corrupt the write.
-
-**Revised question.** All four candidate strategies are correct. What do they cost?
-
-| Strategy | Correct? | Open question |
-|---|---|---|
-| Single statement + CHECK | yes (measured) | baseline |
-| `SELECT FOR UPDATE` | yes | does serialising contenders cost more than it saves? |
-| `version` column + retry | yes | at what contention does retry waste exceed lock waiting? |
-| `SERIALIZABLE` | yes | what is the serialization-failure rate under this workload? |
-
-The `version` column is retained because the comparison requires it. Days 8–10
-measure throughput, p99, and retry rate for each at low and high contention.
+**Hypothesis to be tested (Days 8–10):** optimistic locking wins at low
+contention, where retries are rare and lock-waiting is pure overhead; pessimistic
+locking wins at high contention, where the retry rate makes optimistic writes
+waste more work than waiting would have cost. `SERIALIZABLE` isolation is
+measured as a third data point. This is a hypothesis, not a finding — the
+benchmark table in `docs/metrics.md` will record what actually happens.
 
 ---
 

@@ -1,4 +1,4 @@
-# Day 2 — <date>
+# Day 2 — Reproduce Problem
 
 **Goal:** Understand data races; build the smallest version of the double-booking bug.
 
@@ -40,7 +40,7 @@ ok
 Data model + migrations. The lock moves into Postgres.
 
 
-# Day 3 - <postgre sql>
+# Day 3 — Database Layer
 
 **Goal:** Understand and create database on loka repository that will support the simulation of booking
 
@@ -63,7 +63,7 @@ ERROR:  new row for relation "inventory_units" violates check constraint "chk_av
 DETAIL:  Failing row contains (4f5cc513-9559-4c95-880e-2579c910942e, Deluxe Cabin, null, 50, 10, IDR, 150000000, 1, 2026-09-07 16:15:54.910336+00, 2026-09-07 16:15:54.910336+00, 0).
 ```
 
-## Day 4 — <date>
+## Day 4 — Naive Booking
 Built the naive booking endpoint. Sequential behaviour is fully correct:
 201 with computed total, availability 10 → 9, 409 when sold out, 404 on
 unknown unit, 400 on bad input.
