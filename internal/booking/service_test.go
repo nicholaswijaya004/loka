@@ -693,6 +693,18 @@ func TestServiceCreateIdempotent(t *testing.T) {
 			wantInsCalls:     1,
 			wantReleaseCalls: 1,
 		},
+		{
+			// The winner released its claim between our failed INSERT and this
+			// lookup. The key is free again, so the client should retry rather
+			// than receive a 500.
+			name: "claim released by the winner mid-race is retriable",
+			store: &fakeStore{
+				claimResult: false,
+				getKeyErr:   storage.ErrIdempotencyKeyNotFound,
+			},
+			wantErr:         ErrRequestInFlight,
+			wantGetKeyCalls: 1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -916,5 +928,27 @@ func TestServiceCreateIdempotentReleaseFailurePreservesOriginalError(t *testing.
 	}
 	if store.releaseCalls != 1 {
 		t.Errorf("ReleaseIdempotencyKey calls: got %d, want 1", store.releaseCalls)
+	}
+}
+
+func TestServiceCreateIdempotentReleasesOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store := &fakeStore{
+		claimResult: true,
+		unit:        testUnit(0, 10, 1), // forces Create to fail
+	}
+	svc := NewService(store, testLogger, false)
+
+	_, _, err := svc.CreateIdempotent(ctx, testKey, testHash,
+		testUnitID, testCustomerID, 1, testVisit)
+
+	if !errors.Is(err, ErrSoldOut) {
+		t.Errorf("error: got %v, want %v", err, ErrSoldOut)
+	}
+	if store.releaseCalls != 1 {
+		t.Errorf("ReleaseIdempotencyKey calls: got %d, want 1 — cleanup must run on a dead context",
+			store.releaseCalls)
 	}
 }
