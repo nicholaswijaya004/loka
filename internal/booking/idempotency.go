@@ -2,6 +2,7 @@ package booking
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/nicholaswijaya004/loka/internal/storage"
@@ -22,6 +23,10 @@ func (s *Service) CreateIdempotent(
 
 	if !claimed {
 		existing, err := s.store.GetIdempotencyKey(ctx, key)
+		if errors.Is(err, storage.ErrIdempotencyKeyNotFound) {
+			return nil, false, ErrRequestInFlight
+		}
+
 		if err != nil {
 			return nil, false, err
 		}
@@ -50,7 +55,9 @@ func (s *Service) CreateIdempotent(
 
 	booking, err := s.Create(ctx, unitID, customerID, qty, visitDateTime)
 	if err != nil {
-		errIn := s.store.ReleaseIdempotencyKey(ctx, key)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		errIn := s.store.ReleaseIdempotencyKey(releaseCtx, key)
 		if errIn != nil {
 			s.logger.Error("failed to release idempotency key", "error", errIn)
 		}
