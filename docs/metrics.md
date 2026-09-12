@@ -216,3 +216,10 @@ To be measured in week 2:
   does, given the latency increase on day 6.
 - Mutex vs atomic throughput across `-cpu=1,2,4,8` (benchmark recorded but not
   yet transcribed here).
+
+**The unsafe run reported zero HTTP failures.** All 500 requests returned 201.
+A monitoring dashboard would have shown a 100% success rate while the service
+oversold by 4,900% and left 7 seats still marked available. Nothing in the
+response codes, the logs, or the metrics would indicate a problem — which is
+why the invariant has to be enforced where the data lives rather than inferred
+from what the application reports.
