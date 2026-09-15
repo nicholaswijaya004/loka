@@ -211,3 +211,80 @@ silently doing the wrong thing.
 
 **Tomorrow:** `SELECT FOR UPDATE` as the second of four concurrency strategies,
 measured on cost rather than correctness.
+
+## Day 9
+
+**Goal:** Implement `SELECT FOR UPDATE` as the second concurrency strategy and
+measure what it costs. Since day 5 the question is no longer which approach is
+correct — the single-statement decrement plus a CHECK constraint already
+prevents overselling — but what each approach costs to get there.
+
+**First, made the measurements reproducible.** Every benchmark this week needed
+a manual reset, a killed process, or an env-var check, and three "clean" runs
+on day 8 were silently polluted by a hardcoded failure-injection probability.
+`scripts/bench.sh` now does the whole cycle in one command: kill anything on the
+port, `make reset`, start the server with whatever env the caller passed, poll
+`/healthz`, run k6, verify `available_units + count(bookings) == total_units`
+directly against the database, and kill the server via a `trap` so cleanup
+happens even on failure or Ctrl-C.
+
+That was an hour well spent. Every number below came out of one command.
+
+**Prediction before measuring:** at high contention the lock would be close to
+free, because with one seat and 500 requests everyone is queueing anyway.
+
+**Result:**
+
+| Contention | Seats | single-statement p95 | `FOR UPDATE` p95 | Ratio     |
+| ---------- | ----- | -------------------- | ---------------- | --------- |
+| High       | 1     | 311 ms               | 4.26 s           | **13.7×** |
+| Medium     | 10    | 619 ms               | 5.23 s           | **8.5×**  |
+| Low        | 50    | 873 ms               | 5.60 s           | **6.4×**  |
+
+Throughput at medium contention fell from 720 req/s to 82 req/s.
+
+**The prediction was wrong, and the reason is the interesting part.** Without
+the lock, the losers _do not queue_. A sold-out request reads availability
+outside any transaction, fails the check in Go, and returns — it never acquires
+a lock and never waits for one. That is 490 of 500 requests taking a path that
+costs almost nothing.
+
+`FOR UPDATE` removes that fast path. Every request must take the row lock before
+it can even find out whether it is sold out, so all 500 serialise through a
+single row. Pessimistic locking makes every reader pay for exclusivity that only
+the ten eventual writers needed.
+
+Note the ratio _shrinks_ as contention falls: 13.7× at one seat, 6.4× at fifty.
+With more seats a larger share of requests are genuine writers who would have to
+serialise anyway, so the lock's overhead is proportionally smaller.
+
+**Limit of the finding.** This workload is 98% rejections. A workload where most
+requests succeed would narrow the gap considerably, because the single-statement
+strategy's advantage comes entirely from letting losers exit early. Worth
+re-measuring with a larger inventory before generalising.
+
+**Understood:**
+
+- `FOR UPDATE` outside a transaction is useless. The lock is released the moment
+  the implicit single-statement transaction commits, so it acquires and drops it
+  in the same breath. Silent, and easy to get wrong — documented on the method.
+- The minimum latency stayed low (182–248 ms) in every `FOR UPDATE` run. The
+  first request through is fast; everyone behind accumulates the wait. Textbook
+  queueing behaviour, visible in the gap between min and p95.
+- Both strategies had to move the read _to different places_: single-statement
+  reads outside the transaction and relies on the decrement being safe on its
+  own; `FOR UPDATE` reads inside, because the whole point is that the value
+  cannot change between reading it and acting on it.
+
+**Cost me time:**
+
+- A `:=` inside the `WithTx` closure shadowed the outer `booking` variable, so
+  the function returned nil with no error. Legal Go, invisible to `go vet`, and
+  it would have panicked in the handler. The `shadow` analyzer would have caught
+  it; it is not in my golangci-lint config.
+- `p95` for the same code varied 344–843 ms on the single-statement strategy and
+  3.62–5.46 s on `FOR UPDATE`. Single runs on a laptop under Docker Desktop are
+  not measurements. Medians of three from here on, with the range recorded.
+
+**Tomorrow:** optimistic locking with the `version` column, and the retry rate
+as contention rises.

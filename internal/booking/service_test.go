@@ -26,6 +26,9 @@ type fakeStore struct {
 	decNewAvail    int
 	decUnitID      uuid.UUID
 
+	forUpdateCalls int
+	unitCalls      int
+
 	insErr   error
 	insCalls int
 	inserted *storage.Booking
@@ -56,6 +59,15 @@ type fakeStore struct {
 }
 
 func (f *fakeStore) GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	f.unitCalls++
+	if f.unitErr != nil {
+		return nil, f.unitErr
+	}
+	return f.unit, nil
+}
+
+func (f *fakeStore) GetInventoryUnitForUpdate(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	f.forUpdateCalls++
 	if f.unitErr != nil {
 		return nil, f.unitErr
 	}
@@ -252,11 +264,12 @@ func TestServiceCreate(t *testing.T) {
 			wantInsCalls: 0,
 		},
 		{
-			// Documents current, deliberately unsafe behaviour: the decrement has
-			// already committed when the insert fails, so a unit is consumed with
-			// no booking to show for it. Day 8's transaction removes this, and
-			// this test's expectations should change when it does.
-			name:         "insert failure leaves the decrement committed",
+			// Since day 8 the flow is transactional, so a failed insert rolls the
+			// decrement back. The fake cannot model a rollback (its WithTx just
+			// calls fn), so this case asserts only that both calls were attempted
+			// and the error propagated. The rollback itself is verified by the
+			// FAIL_AFTER_DECREMENT k6 run, which held the invariant at 0+10=10.
+			name:         "insert failure is propagated and the transaction rolls back",
 			qty:          1,
 			store:        &fakeStore{unit: testUnit(10, 10, 1), insErr: errStore},
 			wantErr:      errStore,
@@ -295,7 +308,7 @@ func TestServiceCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(tt.store, testLogger, false)
+			svc := NewService(tt.store, testLogger, false, "single") // single-statement strategy is the default
 
 			got, err := svc.Create(context.Background(), testUnitID, testCustomerID, tt.qty, testVisit)
 
@@ -327,7 +340,7 @@ func TestServiceCreate(t *testing.T) {
 
 func TestServiceCreateBuildsBookingCorrectly(t *testing.T) {
 	store := &fakeStore{unit: testUnit(10, 10, 1)}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	const qty = 3
 
@@ -370,7 +383,7 @@ func TestServiceCreateBuildsBookingCorrectly(t *testing.T) {
 
 func TestServiceCreatePassesQuantityToStore(t *testing.T) {
 	store := &fakeStore{unit: testUnit(10, 10, 1)}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	const qty = 4
 
@@ -392,7 +405,7 @@ func TestServiceCreatePassesQuantityToStore(t *testing.T) {
 func TestServiceUnsafeFlagRouting(t *testing.T) {
 	t.Run("unsafe flag set", func(t *testing.T) {
 		store := &fakeStore{unit: testUnit(10, 10, 1)}
-		svc := NewService(store, testLogger, true)
+		svc := NewService(store, testLogger, true, "single")
 
 		if _, err := svc.Create(context.Background(), testUnitID, testCustomerID, 3, testVisit); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -411,7 +424,7 @@ func TestServiceUnsafeFlagRouting(t *testing.T) {
 
 	t.Run("unsafe flag clear", func(t *testing.T) {
 		store := &fakeStore{unit: testUnit(10, 10, 1)}
-		svc := NewService(store, testLogger, false)
+		svc := NewService(store, testLogger, false, "single")
 
 		if _, err := svc.Create(context.Background(), testUnitID, testCustomerID, 3, testVisit); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -467,7 +480,7 @@ func TestServiceGet(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(tt.store, testLogger, false)
+			svc := NewService(tt.store, testLogger, false, "single")
 
 			got, err := svc.Get(context.Background(), bookingID)
 
@@ -720,7 +733,7 @@ func TestServiceCreateIdempotent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(tt.store, testLogger, false)
+			svc := NewService(tt.store, testLogger, false, "single")
 
 			got, replayed, err := svc.CreateIdempotent(
 				context.Background(), testKey, testHash,
@@ -781,7 +794,7 @@ func TestServiceCreateIdempotentClaimsBeforeBooking(t *testing.T) {
 			State:       "in_progress",
 		},
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	_, _, err := svc.CreateIdempotent(
 		context.Background(), testKey, testHash,
@@ -807,7 +820,7 @@ func TestServiceCreateIdempotentCompletesWithBookingID(t *testing.T) {
 		claimResult: true,
 		unit:        testUnit(10, 10, 1),
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	got, replayed, err := svc.CreateIdempotent(
 		context.Background(), testKey, testHash,
@@ -857,7 +870,7 @@ func TestServiceCreateIdempotentReplayReturnsOriginalBooking(t *testing.T) {
 		},
 		booking: original,
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	got, replayed, err := svc.CreateIdempotent(
 		context.Background(), testKey, testHash,
@@ -893,7 +906,7 @@ func TestServiceCreateIdempotentCompleteFailureAfterBooking(t *testing.T) {
 		unit:        testUnit(10, 10, 1),
 		completeErr: errStore,
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	got, _, err := svc.CreateIdempotent(
 		context.Background(), testKey, testHash,
@@ -924,7 +937,7 @@ func TestServiceCreateIdempotentReleaseFailurePreservesOriginalError(t *testing.
 		unit:        testUnit(0, 10, 1),
 		releaseErr:  releaseErr,
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	_, _, err := svc.CreateIdempotent(
 		context.Background(), testKey, testHash,
@@ -950,7 +963,7 @@ func TestServiceCreateIdempotentReleasesOnCancelledContext(t *testing.T) {
 		claimResult: true,
 		unit:        testUnit(0, 10, 1), // forces Create to fail
 	}
-	svc := NewService(store, testLogger, false)
+	svc := NewService(store, testLogger, false, "single")
 
 	_, _, err := svc.CreateIdempotent(ctx, testKey, testHash,
 		testUnitID, testCustomerID, 1, testVisit)
@@ -961,5 +974,66 @@ func TestServiceCreateIdempotentReleasesOnCancelledContext(t *testing.T) {
 	if store.releaseCalls != 1 {
 		t.Errorf("ReleaseIdempotencyKey calls: got %d, want 1 — cleanup must run on a dead context",
 			store.releaseCalls)
+	}
+}
+
+// TestServiceCreateStrategyRouting pins which read path each strategy takes.
+// The distinction matters: the single-statement strategy reads availability
+// outside the transaction and relies on the decrement being safe on its own,
+// while the for-update strategy reads a locked row inside the transaction so
+// the value cannot change before it acts on it.
+func TestServiceCreateStrategyRouting(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy string
+
+		wantUnitCalls      int
+		wantForUpdateCalls int
+	}{
+		{
+			name:               "for-update strategy reads the locked row",
+			strategy:           "forupdate",
+			wantUnitCalls:      0,
+			wantForUpdateCalls: 1,
+		},
+		{
+			name:               "single-statement strategy reads without a lock",
+			strategy:           "single",
+			wantUnitCalls:      1,
+			wantForUpdateCalls: 0,
+		},
+		{
+			name:               "an unrecognised strategy falls back to single-statement",
+			strategy:           "nonsense",
+			wantUnitCalls:      1,
+			wantForUpdateCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{unit: testUnit(10, 10, 1)}
+			svc := NewService(store, testLogger, false, tt.strategy)
+
+			got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil {
+				t.Fatal("booking: got nil, want a booking")
+			}
+
+			if store.unitCalls != tt.wantUnitCalls {
+				t.Errorf("GetInventoryUnit calls: got %d, want %d", store.unitCalls, tt.wantUnitCalls)
+			}
+			if store.forUpdateCalls != tt.wantForUpdateCalls {
+				t.Errorf("GetInventoryUnitForUpdate calls: got %d, want %d",
+					store.forUpdateCalls, tt.wantForUpdateCalls)
+			}
+			if store.withTxCalls != 1 {
+				t.Errorf("WithTx calls: got %d, want 1 — both strategies must be transactional",
+					store.withTxCalls)
+			}
+		})
 	}
 }

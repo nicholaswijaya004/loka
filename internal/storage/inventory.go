@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"time"
 )
 
 type InventoryUnit struct {
@@ -81,4 +82,27 @@ func (s *Store) DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, n
 		return ErrUnitNotFound
 	}
 	return nil
+}
+
+// GetInventoryUnitForUpdate reads a unit and holds an exclusive row lock until
+// the surrounding transaction ends. Concurrent callers attempting the same read
+// block rather than proceeding on a stale value. Must be called inside a
+// transaction — outside one the lock is released immediately and is useless.
+func (s *Store) GetInventoryUnitForUpdate(ctx context.Context, id uuid.UUID) (*InventoryUnit, error) {
+	var u InventoryUnit
+	err := s.db.QueryRow(ctx, `
+        SELECT unit_id, name, description, available_units, total_units,
+               currency, price_minor, min_book, version, created_at, updated_at
+        FROM inventory_units WHERE unit_id = $1 FOR UPDATE`, id,
+	).Scan(
+		&u.UnitID, &u.Name, &u.Description, &u.AvailableUnits, &u.TotalUnits,
+		&u.Currency, &u.PriceMinor, &u.MinBook, &u.Version, &u.CreatedAt, &u.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUnitNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get inventory unit for update: %w", err)
+	}
+	return &u, nil
 }
