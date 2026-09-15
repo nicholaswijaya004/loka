@@ -3,10 +3,11 @@ package booking
 import (
 	"context"
 	"errors"
-	"github.com/google/uuid"
-	"github.com/nicholaswijaya004/loka/internal/storage"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/nicholaswijaya004/loka/internal/storage"
 )
 
 type Service struct {
@@ -29,6 +30,7 @@ type Store interface {
 	GetIdempotencyKey(ctx context.Context, key string) (*storage.IdempotencyKey, error)
 	CompleteIdempotencyKey(ctx context.Context, key string, bookingID uuid.UUID, responseStatus int, responseBody []byte) error
 	ReleaseIdempotencyKey(ctx context.Context, key string) error
+	WithTx(ctx context.Context, fn func(Store) error) error
 }
 
 func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
@@ -47,19 +49,6 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 		return nil, ErrSoldOut
 	}
 
-	if s.unsafe {
-		err = s.store.DecrementAvailabilityUnsafe(ctx, unitID, unit.AvailableUnits-qty)
-	} else {
-		err = s.store.DecrementAvailability(ctx, unitID, qty)
-	}
-
-	if errors.Is(err, storage.ErrSoldOut) {
-		return nil, ErrSoldOut
-	}
-	if err != nil {
-		return nil, err
-	}
-
 	// Create a new booking
 	booking := &storage.Booking{
 		UnitID:        unitID,
@@ -70,10 +59,27 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 		Currency:      unit.Currency,
 		BookingStatus: "pending",
 	}
-	err = s.store.InsertBooking(ctx, booking)
+
+	err = s.store.WithTx(ctx, func(tx Store) error {
+		if s.unsafe {
+			if err := tx.DecrementAvailabilityUnsafe(ctx, unitID, unit.AvailableUnits-qty); err != nil {
+				return err
+			}
+		} else {
+			if err := tx.DecrementAvailability(ctx, unitID, qty); err != nil {
+				return err
+			}
+		}
+		return tx.InsertBooking(ctx, booking)
+	})
+
+	if errors.Is(err, storage.ErrSoldOut) {
+		return nil, ErrSoldOut
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	return booking, nil
 }
 

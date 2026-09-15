@@ -50,6 +50,9 @@ type fakeStore struct {
 
 	releaseErr   error
 	releaseCalls int
+
+	withTxCalls int
+	withTxErr   error
 }
 
 func (f *fakeStore) GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
@@ -120,6 +123,14 @@ func (f *fakeStore) CompleteIdempotencyKey(ctx context.Context, key string, book
 func (f *fakeStore) ReleaseIdempotencyKey(ctx context.Context, key string) error {
 	f.releaseCalls++
 	return f.releaseErr
+}
+
+func (f *fakeStore) WithTx(ctx context.Context, fn func(Store) error) error {
+	f.withTxCalls++
+	if f.withTxErr != nil {
+		return f.withTxErr
+	}
+	return fn(f)
 }
 
 // testUnit returns an inventory unit with sensible defaults, adjustable per test.

@@ -10,7 +10,7 @@ Postgres 16 in Docker capped at 512 MB, connection pool `MaxConns = 50`, with k6
 
 Absolute throughput and latency are therefore not representative — the load
 generator competes with the service for the same four cores, and the service
-competes with Postgres. What these figures support is *relative* comparison: two
+competes with Postgres. What these figures support is _relative_ comparison: two
 runs differing by one line of code under identical contention.
 
 ---
@@ -49,14 +49,14 @@ route around them.
 
 **Verified by attempting to violate each constraint directly in psql:**
 
-| Constraint | Attempt | Result |
-|---|---|---|
-| `chk_availability` | `UPDATE inventory_units SET available_units = -1` | rejected — 23514 |
-| `chk_availability` | `SET available_units = 50` (total 10) | rejected — 23514 |
-| `chk_booking_status` | `INSERT ... booking_status = 'banana'` | rejected — 23514 |
-| `idx_payments_one_success_per_booking` | 2 failed + 1 succeeded payment | all accepted |
-| `idx_payments_one_success_per_booking` | a second `succeeded` payment | **rejected** — 23505 |
-| `idempotency_keys` PK | same key inserted twice | rejected — 23505 |
+| Constraint                             | Attempt                                           | Result               |
+| -------------------------------------- | ------------------------------------------------- | -------------------- |
+| `chk_availability`                     | `UPDATE inventory_units SET available_units = -1` | rejected — 23514     |
+| `chk_availability`                     | `SET available_units = 50` (total 10)             | rejected — 23514     |
+| `chk_booking_status`                   | `INSERT ... booking_status = 'banana'`            | rejected — 23514     |
+| `idx_payments_one_success_per_booking` | 2 failed + 1 succeeded payment                    | all accepted         |
+| `idx_payments_one_success_per_booking` | a second `succeeded` payment                      | **rejected** — 23505 |
+| `idempotency_keys` PK                  | same key inserted twice                           | rejected — 23505     |
 
 ```
 ERROR:  duplicate key value violates unique constraint "idx_payments_one_success_per_booking"
@@ -69,7 +69,7 @@ DETAIL:  Key (booking_id)=(3097064b-d804-44aa-b67f-71d21a110e73) already exists.
 - a partial unique index permits many payment attempts while forbidding a second
   success — the thing a plain `UNIQUE (booking_id)` could not express
 - the same feature serves speed elsewhere: `CREATE INDEX ... WHERE published_at
-  IS NULL` indexes only the outbox rows the relay queries, and rows leave the
+IS NULL` indexes only the outbox rows the relay queries, and rows leave the
   index automatically once published
 - hit a dirty migration state twice and recovered with `migrate force`
 
@@ -88,11 +88,11 @@ Sequential behaviour is entirely correct: 201 with a computed total, availabilit
 **Verified graceful shutdown** by signalling SIGTERM one second into a 5-second
 handler:
 
-| | |
-|---|---|
-| Signal received | 02:49:07.722 |
-| Shutdown complete | 02:49:11.961 |
-| Drain | **4.24 s** |
+|                   |                    |
+| ----------------- | ------------------ |
+| Signal received   | 02:49:07.722       |
+| Shutdown complete | 02:49:11.961       |
+| Drain             | **4.24 s**         |
 | In-flight request | completed normally |
 
 The same shutdown with nothing in flight completes in 2 ms.
@@ -116,17 +116,17 @@ make reset && make run
 k6 run scripts/k6/contention.js
 ```
 
-| Decrement strategy | SQL | Bookings | `available_units` | Invariant | Overbooked |
-|---|---|---|---|---|---|
-| Computed in SQL | `SET available_units = available_units - $1` | **10** | 0 | 0+10=10 ✓ | 0 |
-| Computed in Go | `SET available_units = $1` | **500** | 8 | 8+500=508 ✗ | **490** |
+| Decrement strategy | SQL                                          | Bookings | `available_units` | Invariant   | Overbooked |
+| ------------------ | -------------------------------------------- | -------- | ----------------- | ----------- | ---------- |
+| Computed in SQL    | `SET available_units = available_units - $1` | **10**   | 0                 | 0+10=10 ✓   | 0          |
+| Computed in Go     | `SET available_units = $1`                   | **500**  | 8                 | 8+500=508 ✗ | **490**    |
 
 The second row runs with `UNSAFE_DECREMENT=1 make run`. Identical code paths
 apart from that one statement.
 
 **Why the SQL version holds.** The decrement is a single statement. Postgres
 takes a row lock for its duration and evaluates `available_units - $1` against
-the *current committed value*, not against whatever the application read moments
+the _current committed value_, not against whatever the application read moments
 earlier. Fifty requests that all read `available_units = 10` still produce
 10, 9, 8 … because each subtraction operates on fresh state. The eleventh is
 rejected by `chk_availability`, surfaces as 23514, and becomes a 409.
@@ -141,7 +141,7 @@ constraint has nothing to reject. A constraint can only defend an invariant the
 database is able to evaluate.
 
 **Single-seat contention:** 500 requests against 1 seat produced 1 booking and
-499 conflicts. That case is *easier* than the 10-seat one — the first decrement
+499 conflicts. That case is _easier_ than the 10-seat one — the first decrement
 takes availability to zero, so every later check fails legitimately and there is
 barely a window.
 
@@ -164,24 +164,24 @@ k6 run scripts/k6/retry.js
 
 **Sequential — two identical requests, same `Idempotency-Key`:**
 
-| | Before | After |
-|---|---|---|
-| Responses | 201, 201 | 201, **200** |
-| `Idempotent-Replay` | — | `true` on the second |
-| Booking ids | two distinct | **identical** |
-| Bookings | 2 | **1** |
-| `available_units` | 10 → 8 | 10 → **9** |
+|                     | Before       | After                |
+| ------------------- | ------------ | -------------------- |
+| Responses           | 201, 201     | 201, **200**         |
+| `Idempotent-Replay` | —            | `true` on the second |
+| Booking ids         | two distinct | **identical**        |
+| Bookings            | 2            | **1**                |
+| `available_units`   | 10 → 8       | 10 → **9**           |
 
 **Concurrent — 500 VUs sharing one key:**
 
-| | Before | After |
-|---|---|---|
-| Bookings created | 10 | **1** |
-| `available_units` | 10 → 0 | 10 → **9** |
-| Seats lost to duplicates | 9 | **0** |
-| 409 in-flight | — | 499 |
-| 5xx | 0 | 0 |
-| p95 | 215 ms | 684 ms |
+|                          | Before | After      |
+| ------------------------ | ------ | ---------- |
+| Bookings created         | 10     | **1**      |
+| `available_units`        | 10 → 0 | 10 → **9** |
+| Seats lost to duplicates | 9      | **0**      |
+| 409 in-flight            | —      | 499        |
+| 5xx                      | 0      | 0          |
+| p95                      | 215 ms | 684 ms     |
 
 Latency rose because 500 requests now contend on one row in `idempotency_keys`
 rather than spreading across ten inventory rows — the cost of funnelling every
@@ -207,7 +207,7 @@ guarantee. A misspelled column name passes every test in the package.
 
 To be measured in week 2:
 
-- Throughput and p99 for four *correct* concurrency strategies — single
+- Throughput and p99 for four _correct_ concurrency strategies — single
   statement, `SELECT FOR UPDATE`, optimistic `version` column, and
   `SERIALIZABLE` — at low and high contention. Day 5 established that the single
   statement is already correct; what the alternatives cost is open.
@@ -223,3 +223,53 @@ oversold by 4,900% and left 7 seats still marked available. Nothing in the
 response codes, the logs, or the metrics would indicate a problem — which is
 why the invariant has to be enforced where the data lives rather than inferred
 from what the application reports.
+
+## Day 8
+
+**Goal:** Make the booking flow atomic, and measure what that costs.
+
+Environment: macOS, Docker Desktop, 500 VUs, 10 seats, `MaxConns = 50`.
+Note this differs from the WSL2 host used on days 2–7 — Docker Desktop adds a
+VM layer between the container and the host, so figures here are **not**
+comparable with earlier days. Same-host comparisons only.
+
+**Correctness:**
+
+| Flow                                        | Bookings | `available_units` | Invariant     | Seats lost |
+| ------------------------------------------- | -------- | ----------------- | ------------- | ---------- |
+| Decrement and insert as separate statements | 8        | 0                 | 0 + 8 = 8 ✗   | **2**      |
+| Both inside one transaction                 | 10       | 0                 | 0 + 10 = 10 ✓ | **0**      |
+
+With failure deliberately injected after the decrement
+(`FAIL_AFTER_DECREMENT=0.3`), the transactional version still held:
+
+|                                          | Errors | Bookings | `available_units` | Invariant     |
+| ---------------------------------------- | ------ | -------- | ----------------- | ------------- |
+| Transaction, 30% injected insert failure | 5      | 10       | 0                 | 0 + 10 = 10 ✓ |
+
+Five requests decremented availability and then failed. All five rolled back.
+Pre-transaction, the equivalent failures consumed the seats permanently.
+
+**Cost:**
+
+| Configuration              | p95    | Errors |
+| -------------------------- | ------ | ------ |
+| Transaction, no injection  | 1.41 s | 0      |
+| Transaction, 30% injection | 1.99 s | 5      |
+
+A transaction holds a pool connection for its entire duration rather than for
+each statement, so 500 concurrent requests against `MaxConns = 50` queue
+considerably harder. [TODO: same-host pre-transaction baseline — the ~280 ms
+figure from day 5 was measured under WSL2 and is not a valid comparison.]
+
+Single runs on a laptop vary widely; p95 readings across runs on this host
+ranged 0.74–1.99 s. Figures above are [TODO: single run / median of N].
+
+**Idempotency, unchanged through the transactional path:**
+
+| 500 VUs, one shared key | Result |
+| ----------------------- | ------ |
+| Bookings created        | 1      |
+| 409 in-flight           | 499    |
+| `available_units`       | 10 → 9 |
+| p95                     | 190 ms |
