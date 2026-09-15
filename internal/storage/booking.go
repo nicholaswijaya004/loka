@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"time"
 )
 
 type Booking struct {
@@ -25,7 +29,19 @@ type Booking struct {
 	UpdatedAt     time.Time
 }
 
+var failAfterDecrement = func() float64 {
+	f, err := strconv.ParseFloat(os.Getenv("FAIL_AFTER_DECREMENT"), 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}()
+
 func (s *Store) InsertBooking(ctx context.Context, b *Booking) error {
+	if failAfterDecrement > 0 && rand.Float64() < failAfterDecrement {
+		return fmt.Errorf("injected failure: insert booking after decrement")
+	}
+
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO bookings (unit_id, customer_id, qty, visit_date_time,
 		                      total_minor, currency, booking_status)

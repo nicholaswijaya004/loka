@@ -17,6 +17,16 @@ import (
 	"github.com/nicholaswijaya004/loka/internal/storage"
 )
 
+type storeAdapter struct {
+	*storage.Store
+}
+
+func (a storeAdapter) WithTx(ctx context.Context, fn func(booking.Store) error) error {
+	return a.Store.WithTx(ctx, func(tx *storage.Store) error {
+		return fn(storeAdapter{Store: tx})
+	})
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -51,7 +61,7 @@ func main() {
 
 	store := storage.NewStore(pool)
 	unsafe := os.Getenv("UNSAFE_DECREMENT") == "1"
-	svc := booking.NewService(store, logger, unsafe)
+	svc := booking.NewService(storeAdapter{store}, logger, unsafe)
 	if unsafe {
 		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
 	}
