@@ -11,17 +11,19 @@ import (
 )
 
 type Service struct {
-	store  Store
-	logger *slog.Logger
-	unsafe bool
+	store    Store
+	logger   *slog.Logger
+	unsafe   bool
+	strategy string
 }
 
-func NewService(store Store, logger *slog.Logger, unsafe bool) *Service {
-	return &Service{store: store, logger: logger, unsafe: unsafe}
+func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string) *Service {
+	return &Service{store: store, logger: logger, unsafe: unsafe, strategy: strategy}
 }
 
 type Store interface {
 	GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
+	GetInventoryUnitForUpdate(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
 	DecrementAvailability(ctx context.Context, id uuid.UUID, qty int) error
 	DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error
 	InsertBooking(ctx context.Context, b *storage.Booking) error
@@ -37,6 +39,62 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 	if qty <= 0 {
 		return nil, ErrInvalidQty
 	}
+
+	if s.strategy == "forupdate" {
+		return s.createForUpdate(ctx, unitID, customerID, qty, visitDateTime)
+	}
+	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
+}
+
+func (s *Service) createForUpdate(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
+	var booking *storage.Booking
+
+	err := s.store.WithTx(ctx, func(tx Store) error {
+		// Check if the inventory unit exists and is available
+		unit, err := tx.GetInventoryUnitForUpdate(ctx, unitID)
+		if err != nil {
+			return err
+		}
+		if unit.MinBook > qty {
+			return ErrMinBook
+		}
+		if unit.AvailableUnits < qty {
+			return ErrSoldOut
+		}
+
+		// Create a new booking
+		booking = &storage.Booking{
+			UnitID:        unitID,
+			CustomerID:    customerID,
+			Qty:           qty,
+			VisitDateTime: visitDateTime,
+			TotalMinor:    int64(qty) * unit.PriceMinor,
+			Currency:      unit.Currency,
+			BookingStatus: "pending",
+		}
+		if s.unsafe {
+			if err := tx.DecrementAvailabilityUnsafe(ctx, unitID, unit.AvailableUnits-qty); err != nil {
+				return err
+			}
+		} else {
+			if err := tx.DecrementAvailability(ctx, unitID, qty); err != nil {
+				return err
+			}
+		}
+		return tx.InsertBooking(ctx, booking)
+	})
+
+	if errors.Is(err, storage.ErrSoldOut) {
+		return nil, ErrSoldOut
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return booking, nil
+}
+
+func (s *Service) createSingleStatement(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
 	// Check if the inventory unit exists and is available
 	unit, err := s.store.GetInventoryUnit(ctx, unitID)
 	if err != nil {

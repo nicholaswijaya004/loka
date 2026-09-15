@@ -273,3 +273,64 @@ ranged 0.74–1.99 s. Figures above are [TODO: single run / median of N].
 | 409 in-flight           | 499    |
 | `available_units`       | 10 → 9 |
 | p95                     | 190 ms |
+
+## Day 9
+
+**Goal:** Measure `SELECT FOR UPDATE` against the single-statement baseline.
+Both are correct; the question is cost.
+
+Environment: macOS, Docker Desktop, 500 VUs, one iteration per VU,
+`MaxConns = 50`, k6 co-located. All figures produced by `scripts/bench.sh`,
+which resets the database, starts the server, polls `/healthz`, runs k6 and
+verifies the invariant against Postgres before exiting.
+
+**Correctness — both strategies, all contention levels:**
+
+| Strategy         | Seats | Bookings | `available_units` | Invariant     |
+| ---------------- | ----- | -------- | ----------------- | ------------- |
+| single-statement | 1     | 1        | 0                 | 0 + 1 = 1 ✓   |
+| single-statement | 10    | 10       | 0                 | 0 + 10 = 10 ✓ |
+| single-statement | 50    | 50       | 0                 | 0 + 50 = 50 ✓ |
+| `FOR UPDATE`     | 1     | 1        | 0                 | 0 + 1 = 1 ✓   |
+| `FOR UPDATE`     | 10    | 10       | 0                 | 0 + 10 = 10 ✓ |
+| `FOR UPDATE`     | 50    | 50       | 0                 | 0 + 50 = 50 ✓ |
+
+No overselling under either strategy at any contention level.
+
+**Cost — p95 latency:**
+
+| Contention | Seats | single-statement      | `FOR UPDATE`            | Ratio |
+| ---------- | ----- | --------------------- | ----------------------- | ----- |
+| High       | 1     | 311 ms                | 4.26 s                  | 13.7× |
+| Medium     | 10    | 619 ms (344–843, n=3) | 5.23 s (3.62–5.46, n=3) | 8.5×  |
+| Low        | 50    | 873 ms                | 5.60 s                  | 6.4×  |
+
+**Cost — throughput (medium contention):**
+
+| Strategy         | req/s | Wall time for 500 requests |
+| ---------------- | ----- | -------------------------- |
+| single-statement | 720   | 0.7 s                      |
+| `FOR UPDATE`     | 82    | 6.1 s                      |
+
+**Why the gap is this large.** The single-statement strategy has a fast path for
+requests that will fail: availability is read outside any transaction, the check
+happens in Go, and a sold-out request returns without ever acquiring a lock. In
+this workload that is 490 of 500 requests.
+
+`FOR UPDATE` removes that path. Every request takes the row lock before it can
+discover whether it is sold out, so all 500 serialise through one row. The
+minimum latency stayed at 182–248 ms across all `FOR UPDATE` runs — the first
+request through is fast, and everyone behind it accumulates the wait.
+
+The ratio shrinks as contention falls (13.7× → 6.4×) because with more seats a
+larger proportion of requests are genuine writers that would serialise anyway.
+
+**Caveat.** This workload is 98% rejections at medium contention. The
+single-statement advantage comes entirely from letting rejected requests exit
+early, so a workload where most requests succeed would show a much narrower gap.
+These figures should not be generalised beyond a high-rejection booking path.
+
+**Variance.** p95 on identical code ranged 344–843 ms (single) and 3.62–5.46 s
+(`FOR UPDATE`) across runs on this host. Medians of three, ranges recorded.
+Single-run figures elsewhere in this document should be read with the same
+caution.

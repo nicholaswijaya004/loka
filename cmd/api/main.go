@@ -61,7 +61,12 @@ func main() {
 
 	store := storage.NewStore(pool)
 	unsafe := os.Getenv("UNSAFE_DECREMENT") == "1"
-	svc := booking.NewService(storeAdapter{store}, logger, unsafe)
+	strategy := os.Getenv("STRATEGY")
+	if strategy == "" {
+		strategy = "single"
+	}
+	logger.Info("booking strategy", "strategy", strategy)
+	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy)
 	if unsafe {
 		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
 	}
