@@ -14,6 +14,7 @@ var ErrUnitNotFound = errors.New("inventory unit not found")
 var ErrSoldOut = errors.New("inventory unit sold out")
 var ErrBookingNotFound = errors.New("booking not found")
 var ErrIdempotencyKeyNotFound = errors.New("idempotency key not found")
+var ErrVersionConflict = errors.New("version conflict")
 
 type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row

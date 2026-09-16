@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +17,7 @@ type Service struct {
 	logger   *slog.Logger
 	unsafe   bool
 	strategy string
+	retries  atomic.Int64
 }
 
 func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string) *Service {
@@ -26,6 +29,7 @@ type Store interface {
 	GetInventoryUnitForUpdate(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
 	DecrementAvailability(ctx context.Context, id uuid.UUID, qty int) error
 	DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUID, newAvailable int) error
+	DecrementAvailabilityOptimistic(ctx context.Context, id uuid.UUID, qty int, version int) error
 	InsertBooking(ctx context.Context, b *storage.Booking) error
 	GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error)
 	ClaimIdempotencyKey(ctx context.Context, key, requestHash string) (bool, error)
@@ -43,7 +47,67 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 	if s.strategy == "forupdate" {
 		return s.createForUpdate(ctx, unitID, customerID, qty, visitDateTime)
 	}
+	if s.strategy == "optimistic" {
+		return s.createOptimistic(ctx, unitID, customerID, qty, visitDateTime)
+	}
 	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
+}
+
+const maxOptimisticRetries = 5
+
+func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
+	for attempt := 0; attempt < maxOptimisticRetries; attempt++ {
+		unit, err := s.store.GetInventoryUnit(ctx, unitID)
+		if err != nil {
+			return nil, err
+		}
+		if unit.MinBook > qty {
+			return nil, ErrMinBook
+		}
+		if unit.AvailableUnits < qty {
+			return nil, ErrSoldOut
+		}
+
+		// Create a new booking
+		booking := &storage.Booking{
+			UnitID:        unitID,
+			CustomerID:    customerID,
+			Qty:           qty,
+			VisitDateTime: visitDateTime,
+			TotalMinor:    int64(qty) * unit.PriceMinor,
+			Currency:      unit.Currency,
+			BookingStatus: "pending",
+		}
+
+		err = s.store.WithTx(ctx, func(tx Store) error {
+			if err := tx.DecrementAvailabilityOptimistic(ctx, unitID, qty, unit.Version); err != nil {
+				return err
+			}
+			return tx.InsertBooking(ctx, booking)
+		})
+
+		if errors.Is(err, storage.ErrVersionConflict) {
+			s.retries.Add(1)
+			// Exponential backoff with full jitter. Without it, all contenders
+			// retry in lockstep and regenerate the conflict immediately.
+			backoff := time.Duration(1<<attempt) * 10 * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff)))
+			select {
+			case <-time.After(jitter):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if errors.Is(err, storage.ErrSoldOut) {
+			return nil, ErrSoldOut
+		}
+		if err != nil {
+			return nil, err
+		}
+		return booking, nil
+	}
+	return nil, ErrTooManyRetries
 }
 
 func (s *Service) createForUpdate(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
@@ -144,3 +208,5 @@ func (s *Service) createSingleStatement(ctx context.Context, unitID, customerID 
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (*storage.Booking, error) {
 	return s.store.GetBooking(ctx, id)
 }
+
+func (s *Service) Retries() int64 { return s.retries.Load() }

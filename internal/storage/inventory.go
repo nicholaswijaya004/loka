@@ -44,6 +44,32 @@ func (s *Store) GetInventoryUnit(ctx context.Context, id uuid.UUID) (*InventoryU
 	return &u, nil
 }
 
+func (s *Store) DecrementAvailabilityOptimistic(ctx context.Context, id uuid.UUID, qty int, version int) error {
+	var pgErr *pgconn.PgError
+	tag, err := s.db.Exec(ctx, `
+		UPDATE inventory_units
+		SET available_units = available_units - $1, updated_at = NOW(), version = version + 1
+		WHERE unit_id = $2 and version = $3
+	`, qty, id, version)
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "chk_availability" {
+		return ErrSoldOut
+	}
+	if err != nil {
+		return fmt.Errorf("decrement availability: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		_, err := s.GetInventoryUnit(ctx, id)
+		if errors.Is(err, ErrUnitNotFound) {
+			return ErrUnitNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("decrement optimistic: disambiguating conflict: %w", err)
+		}
+		return ErrVersionConflict
+	}
+	return nil
+}
+
 func (s *Store) DecrementAvailability(ctx context.Context, id uuid.UUID, qty int) error {
 	var pgErr *pgconn.PgError
 	tag, err := s.db.Exec(ctx, `

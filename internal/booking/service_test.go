@@ -51,6 +51,9 @@ type fakeStore struct {
 	completedID    uuid.UUID
 	completeStatus int
 
+	optimisticErrs  []error
+	optimisticCalls int
+
 	releaseErr   error
 	releaseCalls int
 
@@ -85,6 +88,15 @@ func (f *fakeStore) DecrementAvailabilityUnsafe(ctx context.Context, id uuid.UUI
 	f.decUnsafeCalls++
 	f.decNewAvail = newAvailable
 	f.decUnitID = id
+	return f.decErr
+}
+
+func (f *fakeStore) DecrementAvailabilityOptimistic(ctx context.Context, id uuid.UUID, qty, version int) error {
+	i := f.optimisticCalls
+	f.optimisticCalls++
+	if i < len(f.optimisticErrs) {
+		return f.optimisticErrs[i]
+	}
 	return f.decErr
 }
 
@@ -1035,5 +1047,44 @@ func TestServiceCreateStrategyRouting(t *testing.T) {
 					store.withTxCalls)
 			}
 		})
+	}
+}
+
+func TestServiceCreateOptimisticRetriesOnVersionConflict(t *testing.T) {
+	store := &fakeStore{
+		unit:           testUnit(10, 10, 1),
+		optimisticErrs: []error{storage.ErrVersionConflict, storage.ErrVersionConflict, nil},
+	}
+	svc := NewService(store, testLogger, false, "optimistic")
+
+	got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("booking: got nil, want a booking")
+	}
+	if svc.retries.Load() != 2 {
+		t.Errorf("retries: got %d, want 2", svc.retries.Load())
+	}
+}
+
+func TestServiceCreateOptimisticExhaustsRetries(t *testing.T) {
+	store := &fakeStore{
+		unit: testUnit(10, 10, 1),
+		optimisticErrs: []error{
+			storage.ErrVersionConflict, storage.ErrVersionConflict,
+			storage.ErrVersionConflict, storage.ErrVersionConflict,
+			storage.ErrVersionConflict,
+		},
+	}
+	svc := NewService(store, testLogger, false, "optimistic")
+
+	_, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if !errors.Is(err, ErrTooManyRetries) {
+		t.Errorf("error: got %v, want %v", err, ErrTooManyRetries)
+	}
+	if svc.retries.Load() != 5 {
+		t.Errorf("retries: got %d, want 5", svc.retries.Load())
 	}
 }

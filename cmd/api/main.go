@@ -139,5 +139,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger.Info("optimistic retries", "total", svc.Retries())
+
 	logger.Info("shutdown complete")
 }
