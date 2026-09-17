@@ -1070,21 +1070,18 @@ func TestServiceCreateOptimisticRetriesOnVersionConflict(t *testing.T) {
 }
 
 func TestServiceCreateOptimisticExhaustsRetries(t *testing.T) {
-	store := &fakeStore{
-		unit: testUnit(10, 10, 1),
-		optimisticErrs: []error{
-			storage.ErrVersionConflict, storage.ErrVersionConflict,
-			storage.ErrVersionConflict, storage.ErrVersionConflict,
-			storage.ErrVersionConflict,
-		},
+	errs := make([]error, maxOptimisticRetries)
+	for i := range errs {
+		errs[i] = storage.ErrVersionConflict
 	}
+	store := &fakeStore{unit: testUnit(10, 10, 1), optimisticErrs: errs}
 	svc := NewService(store, testLogger, false, "optimistic")
 
 	_, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
 	if !errors.Is(err, ErrTooManyRetries) {
 		t.Errorf("error: got %v, want %v", err, ErrTooManyRetries)
 	}
-	if svc.retries.Load() != 5 {
-		t.Errorf("retries: got %d, want 5", svc.retries.Load())
+	if got := svc.retries.Load(); got != int64(maxOptimisticRetries) {
+		t.Errorf("retries: got %d, want %d", got, maxOptimisticRetries)
 	}
 }

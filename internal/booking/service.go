@@ -39,6 +39,12 @@ type Store interface {
 	WithTx(ctx context.Context, fn func(Store) error) error
 }
 
+const (
+	maxOptimisticBackoff = 2 * time.Second
+	backoffBase          = 10 * time.Millisecond
+	maxBackoffShift      = 10
+)
+
 func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
 	if qty <= 0 {
 		return nil, ErrInvalidQty
@@ -53,7 +59,7 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
 }
 
-const maxOptimisticRetries = 5
+const maxOptimisticRetries = 50
 
 func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
 	for attempt := 0; attempt < maxOptimisticRetries; attempt++ {
@@ -88,9 +94,14 @@ func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.
 
 		if errors.Is(err, storage.ErrVersionConflict) {
 			s.retries.Add(1)
-			// Exponential backoff with full jitter. Without it, all contenders
-			// retry in lockstep and regenerate the conflict immediately.
-			backoff := time.Duration(1<<attempt) * 10 * time.Millisecond
+			shift := attempt
+			if shift > maxBackoffShift {
+				shift = maxBackoffShift
+			}
+			backoff := time.Duration(1<<shift) * backoffBase
+			if backoff > maxOptimisticBackoff {
+				backoff = maxOptimisticBackoff
+			}
 			jitter := time.Duration(rand.Int63n(int64(backoff)))
 			select {
 			case <-time.After(jitter):
