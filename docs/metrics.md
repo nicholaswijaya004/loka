@@ -390,3 +390,105 @@ not yet re-verified under `retries=50` and should not be cited until they are.
 configuration (~6.82s) does not match this session's measured 5.63s. Consistent
 with Day 9's finding that single runs aren't measurements — median of three,
 with range recorded, before either number goes in a final comparison table.
+
+## Day 11
+
+**Goal:** Measure `SERIALIZABLE` isolation against the three earlier strategies.
+The code shape matches optimistic locking — abort on conflict, back off, retry —
+but Postgres detects the conflict (SQLSTATE `40001`) instead of a version column.
+
+Environment: unchanged from Days 9–10 — macOS, Docker Desktop, 500 VUs, one
+iteration per VU, `MaxConns = 50`, k6 co-located, retry budget 50. All figures
+from `scripts/bench.sh`.
+
+**Correctness — all contention levels:**
+
+| Seats | Bookings | Sold out | `available_units` | Invariant     |
+| ----- | -------- | -------- | ----------------- | ------------- |
+| 1     | 1        | 499      | 0                 | 0 + 1 = 1 ✓   |
+| 10    | 10       | 490      | 0                 | 0 + 10 = 10 ✓ |
+| 50    | 50       | 450      | 0                 | 0 + 50 = 50 ✓ |
+
+Every seat sold at every level, so no request gave up while seats remained —
+the Day 10 failure mode (invariant holding while 41 seats went unsold) did not
+occur. No 5xx responses.
+
+**Cost — p95 latency, all four strategies:**
+
+| Contention | Seats | single-statement | `FOR UPDATE` | optimistic (r=50) | `SERIALIZABLE` |
+| ---------- | ----- | ---------------- | ------------ | ----------------- | -------------- |
+| High       | 1     | 311 ms           | 4.26 s       | [TODO]            | 348 ms         |
+| Medium     | 10    | 619 ms (n=3)     | 5.23 s (n=3) | [TODO]            | 1.31 s         |
+| Low        | 50    | 873 ms           | 5.60 s       | 5.63 s            | 2.78 s         |
+
+`SERIALIZABLE` relative to single-statement: 1.1× → 2.1× → 3.2× as seats rise.
+
+**Cost — distribution per level (`SERIALIZABLE`):**
+
+| Seats | req/s | Wall time | min    | median | p95    | max    | Winners p95         |
+| ----- | ----- | --------- | ------ | ------ | ------ | ------ | ------------------- |
+| 1     | 1,212 | 0.4 s     | 293 ms | 327 ms | 348 ms | 377 ms | 293 ms (one winner) |
+| 10    | 337   | 1.5 s     | 495 ms | 1.27 s | 1.31 s | 1.39 s | 1.13 s              |
+| 50    | 175   | 2.9 s     | 1.04 s | 2.74 s | 2.78 s | 2.82 s | 2.58 s              |
+
+Medium-contention throughput: single-statement 720 req/s, `SERIALIZABLE` 337,
+`FOR UPDATE` 82.
+
+**Retries:** 334 `40001` aborts at medium contention — 0.67 per request, about
+33 per successful booking. High and low were not captured (see tooling below).
+
+**Why it lands between the two.** Reads never block under `SERIALIZABLE`. A
+request whose snapshot already shows 0 seats returns sold out without touching a
+lock, so the fast path that `FOR UPDATE` removed survives — which is why the
+1-seat run is within 12% of single-statement while `FOR UPDATE` was 13.7× slower.
+
+A request whose snapshot still shows a seat pays both costs. Its `UPDATE` blocks
+on the row lock held by the current writer, like `FOR UPDATE`. When that writer
+commits, Postgres aborts the waiting transaction with `40001` rather than letting
+it proceed, and it retries like optimistic. Single-statement under
+`READ COMMITTED` waits on the same lock but then re-reads the row and continues;
+`SERIALIZABLE` throws the whole transaction away.
+
+**The ratio runs the opposite way to `FOR UPDATE`.** `FOR UPDATE` went from 13.7×
+to 6.4× as seats rose; `SERIALIZABLE` goes from 1.1× to 3.2×. The two charge
+different requests. `FOR UPDATE` puts every request — rejections included — in
+the lock queue, so its relative cost is highest when almost everything is a
+rejection. `SERIALIZABLE` charges only the requests whose snapshot still showed a
+seat, and there are more of those when there are more seats.
+
+**Losing is not free for everyone.** At medium contention winners had p95
+1.13 s against 1.31 s overall. A request that starts while seats remain must
+block, abort, back off and retry before a fresh snapshot tells it the seats are
+gone. The cheap rejection only applies to requests arriving after sell-out.
+
+**Tooling fault found during this session.** `bench.sh` started the server with
+`go run`, which compiles and runs the binary as a child process. The script
+killed the `go run` wrapper and left the real server running, so its retry total
+was only logged when the next run found it on port 8080. The 334 above was
+printed at the start of the 1-seat run but belongs to the 10-seat server (PID
+8094), which the 1-seat run killed before starting its own. The 1- and 50-seat
+totals were never logged. Day 10's 2,476 was captured by the same script and
+carries the same doubt.
+
+Latency and correctness figures are unaffected: every run reset the database and
+was served by a `SERIALIZABLE` server.
+
+Fixed by building once and running `bin/api` directly, so `$!` is the server,
+and printing the retry line from that run's own log.
+
+A separate failure: `make reset` intermittently failed with `migrate: EOF`. On
+first boot the Postgres image runs a temporary init server that listens only on
+the Unix socket, so `pg_isready` (which used the socket) passed before TCP was
+available. Fixed with `pg_isready -h 127.0.0.1`.
+
+**Variance.** Every `SERIALIZABLE` figure is a single run. Days 9–10 saw p95 on
+identical code vary by up to 2.5×. `SERIALIZABLE` sits below optimistic at 50
+seats (2.78 s vs 5.63 s), but both are single runs and Day 10 already recorded
+5.63 s and 6.82 s for the same configuration. Not a finding until both are
+medians of three.
+
+**Open:**
+
+- Optimistic (retries=50) at 1 and 10 seats
+- `SERIALIZABLE` medium contention ×3, and retry totals at 1 and 50 seats
+- Optimistic retry total at 50 seats, re-measured with the fixed script

@@ -1,8 +1,6 @@
-# Day 2 — Reproduce Problem
+## Day 2 — Reproduce Problem
 
 **Goal:** Understand data races; build the smallest version of the double-booking bug.
-
-## Measured
 
 ### Counter — 1,000,000 increments
 
@@ -29,17 +27,17 @@ PASS
 ok
 ```
 
-## Understood
+### Understood
 
 - `count++` is load/add/store, not one instruction — races live in the gap.
 - Atomics fix single-value ops but can't span "check then act".
 - Mutex throughput degrades as `-cpu` rises; that's the cost of exclusivity.
 
-## Tomorrow
+### Tomorrow
 
 Data model + migrations. The lock moves into Postgres.
 
-# Day 3 — Database Layer
+## Day 3 — Database Layer
 
 **Goal:** Understand and create database on loka repository that will support the simulation of booking
 
@@ -388,3 +386,96 @@ column, no explicit lock; trust Postgres's predicate-based conflict detection
 optimistic's loser-pays-more shape, or does it behave more like `FOR UPDATE`'s
 flat cost? And does SSI's failure rate need the same retries=50-scale tuning,
 or is it a different number entirely?
+
+## Day 11
+
+### What I built
+
+A fourth booking strategy. The code is almost the same as single-statement: read
+the unit, check availability, decrement, insert. The difference is that all of
+it runs inside a `SERIALIZABLE` transaction. There's no row lock and no version
+column. The isolation level does the work, and my job is to retry when Postgres
+says no.
+
+- `WithSerializableTx` opens the transaction with `pgx.TxOptions{IsoLevel: pgx.Serializable}`.
+- `40001` becomes `storage.ErrSerializationFailure`, both in each statement and at `Commit()`.
+- `createSerializable` wraps the whole transaction in the retry loop, with the same backoff as optimistic.
+
+### Prediction before measuring
+
+[fill in: what I guessed — more like pessimistic or more like optimistic?]
+
+### What happened
+
+Correct at all three levels: 1, 10 and 50 seats all sold completely, and the
+invariant held.
+
+p95 was 348 ms, 1.31 s and 2.78 s. That puts it between single-statement and
+`FOR UPDATE`, very close to single-statement at high contention and drifting away
+as seats go up.
+
+### What I understand now
+
+**It's neither pessimistic nor optimistic. It's both, depending on the request.**
+Readers don't block, so if my snapshot says 0 seats I return sold out straight
+away. That's the fast path `FOR UPDATE` killed. But if my snapshot still shows a
+seat, my `UPDATE` waits for whoever holds the row, and when they commit, Postgres
+aborts me with `40001` instead of letting me continue. So I wait _and_ retry.
+
+**That explains why the gap to single-statement grows with seats.** More seats
+means more requests start with a snapshot that shows availability, which means
+more of them go through block → abort → retry. With `FOR UPDATE` it was the
+other way round, because there every request queues, even the ones that will be
+rejected.
+
+**`40001` can come from `Commit()`.** Under `SERIALIZABLE`, Postgres can decide
+at commit time that the transaction can't be serialised. If I only checked the
+statement errors, some aborts would come back as generic 500s instead of being
+retried.
+
+**Rollback happens before the sleep.** The deferred `Rollback` runs when
+`WithSerializableTx` returns, and the backoff happens after that. A sleeping
+request isn't holding one of the 50 pool connections. If the sleep were inside
+the transaction, retries would starve the pool.
+
+**Losers aren't free.** Winners at 10 seats had p95 1.13 s, lower than the
+overall 1.31 s. Requests that lose have to abort and retry before they even find
+out they lost.
+
+### Things that went wrong
+
+**My retry counts were wrong.** `go run` compiles the binary and runs it as a
+child. `$!` gave me the wrapper's PID, so `bench.sh` killed the wrapper and left
+the server running. Its retry total only got printed when the _next_ run killed
+it. The 334 I saw under the 1-seat run actually belongs to the 10-seat run, and
+the 1-seat and 50-seat counts are just gone. That probably affects Day 10's
+2,476 as well. Fix: build once, run `bin/api` directly.
+
+**`make reset` failed randomly with `EOF`.** On a fresh volume, Postgres first
+runs a temporary server for init that only listens on the Unix socket.
+`pg_isready` checked the socket, said ready, and then `migrate` connected over
+TCP and found nothing. Fix: `pg_isready -h 127.0.0.1`.
+
+**Copy-paste in the retry loop.** The optimistic loop checks
+`maxSerializableRetries` for its last attempt. Both are 50, so nothing changes
+and the tests still pass. That's the lesson: the tests only see what they
+assert, and equal defaults hide a wrong variable name.
+
+**The last attempt used to sleep before giving up.** No run hit the retry limit,
+so it never showed up in the numbers, but a request that has already decided to
+fail shouldn't wait up to 2 s first.
+
+### Questions I should be able to answer
+
+- Why doesn't `SERIALIZABLE` block readers, and why does that matter for sold-out requests?
+- What exactly happens when two `SERIALIZABLE` transactions update the same row?
+- Why does single-statement under `READ COMMITTED` not abort in the same situation?
+- Where can `40001` come from, and why does the retry have to wrap the whole transaction?
+- Why is a retry budget a correctness setting and not only a performance setting? (Day 10)
+
+### Still open
+
+- Optimistic at 1 and 10 seats, so the four-way table has no gaps
+- `SERIALIZABLE` medium ×3, plus retry counts at 1 and 50 seats
+- The commit-time `40001` path has no automated test. The fake store never
+  commits. That needs an integration test against real Postgres.

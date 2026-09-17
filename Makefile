@@ -35,8 +35,13 @@ migrate-force:
 reset:
 	docker compose down -v
 	docker compose up -d
-	until docker compose exec -T postgres pg_isready -U loka >/dev/null 2>&1; do sleep 1; done
-	migrate -path migrations -database "$(DB_URL)" up
+	@echo "Waiting for Postgres to accept TCP connections..."
+	@for i in $$(seq 1 30); do \
+		docker compose exec -T postgres pg_isready -h 127.0.0.1 -U loka >/dev/null 2>&1 && exit 0; \
+		sleep 1; \
+	done; \
+	echo "Postgres not ready after 30s" >&2; exit 1
+	migrate -path migrations -database "postgres://loka:loka@localhost:5432/loka?sslmode=disable" up
 	docker compose exec -T postgres psql -U loka -d loka < scripts/seed.sql
 
 seed:

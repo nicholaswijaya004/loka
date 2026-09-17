@@ -23,7 +23,13 @@ type storeAdapter struct {
 
 func (a storeAdapter) WithTx(ctx context.Context, fn func(booking.Store) error) error {
 	return a.Store.WithTx(ctx, func(tx *storage.Store) error {
-		return fn(storeAdapter{Store: tx})
+		return fn(storeAdapter{tx})
+	})
+}
+
+func (a storeAdapter) WithSerializableTx(ctx context.Context, fn func(booking.Store) error) error {
+	return a.Store.WithSerializableTx(ctx, func(tx *storage.Store) error {
+		return fn(storeAdapter{tx})
 	})
 }
 
@@ -65,8 +71,16 @@ func main() {
 	if strategy == "" {
 		strategy = "single"
 	}
+	switch strategy {
+	case "single", "forupdate", "optimistic", "serializable":
+		// valid
+	default:
+		logger.Error("unrecognized STRATEGY", "strategy", strategy)
+		os.Exit(1)
+	}
 	logger.Info("booking strategy", "strategy", strategy)
 	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy)
+
 	if unsafe {
 		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
 	}
@@ -139,7 +153,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("optimistic retries", "total", svc.Retries())
+	logger.Info("retries", "strategy", strategy, "total", svc.Retries())
 
 	logger.Info("shutdown complete")
 }

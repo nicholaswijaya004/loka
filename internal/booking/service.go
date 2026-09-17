@@ -12,16 +12,31 @@ import (
 	"github.com/nicholaswijaya004/loka/internal/storage"
 )
 
+const (
+	defaultMaxOptimisticRetries   = 50
+	defaultMaxSerializableRetries = 50
+)
+
 type Service struct {
 	store    Store
 	logger   *slog.Logger
 	unsafe   bool
 	strategy string
 	retries  atomic.Int64
+
+	maxOptimisticRetries   int
+	maxSerializableRetries int
 }
 
 func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string) *Service {
-	return &Service{store: store, logger: logger, unsafe: unsafe, strategy: strategy}
+	return &Service{
+		store:                  store,
+		logger:                 logger,
+		unsafe:                 unsafe,
+		strategy:               strategy,
+		maxOptimisticRetries:   defaultMaxOptimisticRetries,
+		maxSerializableRetries: defaultMaxSerializableRetries,
+	}
 }
 
 type Store interface {
@@ -37,13 +52,31 @@ type Store interface {
 	CompleteIdempotencyKey(ctx context.Context, key string, bookingID uuid.UUID, responseStatus int, responseBody []byte) error
 	ReleaseIdempotencyKey(ctx context.Context, key string) error
 	WithTx(ctx context.Context, fn func(Store) error) error
+	WithSerializableTx(ctx context.Context, fn func(Store) error) error
 }
 
-const (
-	maxOptimisticBackoff = 2 * time.Second
-	backoffBase          = 10 * time.Millisecond
-	maxBackoffShift      = 10
-)
+func (s *Service) waitWithBackoff(ctx context.Context, attempt int) bool {
+	const (
+		backoffBase     = 10 * time.Millisecond
+		maxBackoff      = 2 * time.Second
+		maxBackoffShift = 10
+	)
+	shift := attempt
+	if shift > maxBackoffShift {
+		shift = maxBackoffShift
+	}
+	backoff := time.Duration(1<<shift) * backoffBase
+	if backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+	jitter := time.Duration(rand.Int63n(int64(backoff)))
+	select {
+	case <-time.After(jitter):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
 	if qty <= 0 {
@@ -56,13 +89,64 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 	if s.strategy == "optimistic" {
 		return s.createOptimistic(ctx, unitID, customerID, qty, visitDateTime)
 	}
+	if s.strategy == "serializable" {
+		return s.createSerializable(ctx, unitID, customerID, qty, visitDateTime)
+	}
 	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
 }
 
-const maxOptimisticRetries = 50
+func (s *Service) createSerializable(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
+	var booking *storage.Booking
+
+	for attempt := 0; attempt < s.maxSerializableRetries; attempt++ {
+		err := s.store.WithSerializableTx(ctx, func(tx Store) error {
+			unit, err := tx.GetInventoryUnit(ctx, unitID)
+			if err != nil {
+				return err
+			}
+			if unit.MinBook > qty {
+				return ErrMinBook
+			}
+			if unit.AvailableUnits < qty {
+				return ErrSoldOut
+			}
+
+			booking = &storage.Booking{
+				UnitID:        unitID,
+				CustomerID:    customerID,
+				Qty:           qty,
+				VisitDateTime: visitDateTime,
+				TotalMinor:    int64(qty) * unit.PriceMinor,
+				Currency:      unit.Currency,
+				BookingStatus: "pending",
+			}
+			if err := tx.DecrementAvailability(ctx, unitID, qty); err != nil {
+				return err
+			}
+			return tx.InsertBooking(ctx, booking)
+		})
+
+		if errors.Is(err, storage.ErrSerializationFailure) {
+			s.retries.Add(1)
+			if !s.waitWithBackoff(ctx, attempt) {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		if errors.Is(err, storage.ErrSoldOut) {
+			return nil, ErrSoldOut
+		}
+		if err != nil {
+			return nil, err
+		}
+		return booking, nil
+	}
+	return nil, ErrTooManyRetries
+}
 
 func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
-	for attempt := 0; attempt < maxOptimisticRetries; attempt++ {
+	for attempt := 0; attempt < s.maxOptimisticRetries; attempt++ {
 		unit, err := s.store.GetInventoryUnit(ctx, unitID)
 		if err != nil {
 			return nil, err
@@ -94,22 +178,12 @@ func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.
 
 		if errors.Is(err, storage.ErrVersionConflict) {
 			s.retries.Add(1)
-			shift := attempt
-			if shift > maxBackoffShift {
-				shift = maxBackoffShift
-			}
-			backoff := time.Duration(1<<shift) * backoffBase
-			if backoff > maxOptimisticBackoff {
-				backoff = maxOptimisticBackoff
-			}
-			jitter := time.Duration(rand.Int63n(int64(backoff)))
-			select {
-			case <-time.After(jitter):
-			case <-ctx.Done():
+			if !s.waitWithBackoff(ctx, attempt) {
 				return nil, ctx.Err()
 			}
 			continue
 		}
+
 		if errors.Is(err, storage.ErrSoldOut) {
 			return nil, ErrSoldOut
 		}
