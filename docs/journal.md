@@ -288,3 +288,103 @@ re-measuring with a larger inventory before generalising.
 
 **Tomorrow:** optimistic locking with the `version` column, and the retry rate
 as contention rises.
+
+## Day 10
+
+**Goal:** Implement optimistic locking (version column + retry-on-conflict) as
+the third concurrency strategy, and measure the retry rate as contention
+rises — continuing from Day 9's single-statement and `FOR UPDATE` baselines.
+
+**Prediction before measuring:** a version-based compare-and-swap should behave
+like single-statement's losers — a cheap failure that doesn't queue — so at low
+contention optimistic should land closer to single-statement than to `FOR
+UPDATE`.
+
+**Result — first pass, `maxOptimisticRetries = 5`, 50 seats / 500 VUs:**
+
+| Metric           | Value      |
+| ---------------- | ---------- |
+| Bookings created | 9          |
+| Failures         | 491 of 500 |
+| `checks_failed`  | 98.20%     |
+| p95              | 2.19 s     |
+| Invariant script | passed     |
+
+**The invariant passing was the trap.** It only checks `available + booked =
+total`, which holds whether 9 or 50 bookings actually succeeded — it can't
+distinguish "sold out" from "gave up." `bookings_created: 9` next to
+`bookings_error: 491` is what exposed it: every one of the 491 losers hit
+`maxOptimisticRetries` before ever landing a clean write, not because the
+inventory ran out.
+
+Added exponential backoff with full jitter (10ms → 20ms → 40ms → 80ms window,
+randomised, cancellable via `ctx.Done()`) on the theory that lockstep retries
+were recreating the same collision. Re-ran: still 491 failures, unchanged.
+That ruled out synchronisation as the cause. Jitter controls _when_ contenders
+retry, not _how many times_ they're allowed to — with 500 requests racing for
+50 slots, 5 attempts was never enough regardless of spacing.
+
+Raised `maxOptimisticRetries` to 50 and re-ran:
+
+| Metric                | Value                      |
+| --------------------- | -------------------------- |
+| Bookings created      | 50                         |
+| Sold out (legitimate) | 450                        |
+| `checks_failed`       | 0%                         |
+| p95, all requests     | 5.63 s                     |
+| p95, winners only     | 3.07 s                     |
+| Total retries logged  | 2,476 (~4.95 mean/request) |
+
+Zero failures, and the invariant now genuinely holds. Cost: p95 landed within a
+hair of `FOR UPDATE`'s 5.60s at the same contention level — tuned correctly,
+optimistic isn't the cheap alternative it looked like at `retries=5`. It
+converges to roughly the same price as blocking.
+
+**The actual finding wasn't the failure count — it was the shape of the cost.**
+Split by outcome, the 50 winners averaged p95=3.07s; the 450 losers pulled the
+overall figure to 5.63s. Losing costs _more_ than winning. That inverts
+single-statement, where losing was nearly free (a fast rejection before any
+lock), and differs from `FOR UPDATE`, where everyone pays the same queueing
+cost regardless of outcome. Under tuned optimistic locking, a request that's
+told "sold out" pays for that answer by retrying and re-reading until it
+personally observes availability hit zero.
+
+**Limit of the finding.** Only 50 seats (low contention) has been re-run with
+the tuned budget and real script output. 1 and 10 seats need the same
+treatment — retries=50, split failure counters, median of three — before the
+comparison table is trustworthy across all three contention levels.
+
+**Understood:**
+
+- A passing invariant check is not the same as a working system.
+  `available + booked = total` is silent on _how_ that total was reached.
+  Splitting `bookings_created` from `bookings_error` is what actually caught
+  the bug.
+- Backoff and jitter fix lockstep collision, not an undersized retry budget.
+  They look identical from the failure count alone until you isolate them —
+  adding jitter and seeing zero change is itself the isolation.
+- A retry budget has to be sized to the real contention ratio (contenders per
+  winning slot), not picked as a small round number. 5 was fine intuition for
+  "a few rivals," wrong by an order of magnitude for 500:50.
+- The expensive path under optimistic locking is losing, not winning — the
+  reverse of what single-statement trained me to expect.
+
+**Cost me time:**
+
+- `TestServiceCreateOptimisticExhaustsRetries` hard-coded 5 canned
+  `ErrVersionConflict` values. Raising `maxOptimisticRetries` to 50 didn't
+  fail it loudly — the fake ran out of errors on attempt 6, fell through to
+  its zero-value `nil`, and the test silently asserted success on a request
+  that should have exhausted retries. Fixed by deriving the fixture length
+  from the constant instead of a literal, so it can't drift again.
+- No ceiling on the backoff formula (`1<<attempt`). Harmless at 5 attempts,
+  but unbounded doubling means a request needing ~20+ attempts would sleep
+  for hours on a single retry. Capped it now, before a higher future budget
+  makes it a real problem instead of a theoretical one.
+
+**Tomorrow:** `SERIALIZABLE` isolation as the fourth approach — no version
+column, no explicit lock; trust Postgres's predicate-based conflict detection
+(SSI) and retry on SQLSTATE `40001`. Open question: does it inherit
+optimistic's loser-pays-more shape, or does it behave more like `FOR UPDATE`'s
+flat cost? And does SSI's failure rate need the same retries=50-scale tuning,
+or is it a different number entirely?

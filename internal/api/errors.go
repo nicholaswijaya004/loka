@@ -2,9 +2,10 @@ package api
 
 import (
 	"errors"
+	"net/http"
+
 	"github.com/nicholaswijaya004/loka/internal/booking"
 	"github.com/nicholaswijaya004/loka/internal/storage"
-	"net/http"
 )
 
 type errorBody struct {
@@ -27,6 +28,8 @@ func errorResponse(err error) (int, string) {
 		return http.StatusUnprocessableEntity, "idempotency key reused with a different request"
 	case errors.Is(err, booking.ErrRequestInFlight):
 		return http.StatusConflict, "a request with this idempotency key is in progress"
+	case errors.Is(err, booking.ErrTooManyRetries):
+		return http.StatusServiceUnavailable, "too many retries, please try again"
 	default:
 		return http.StatusInternalServerError, "internal error"
 	}

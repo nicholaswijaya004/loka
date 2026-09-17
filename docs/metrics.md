@@ -334,3 +334,59 @@ These figures should not be generalised beyond a high-rejection booking path.
 (`FOR UPDATE`) across runs on this host. Medians of three, ranges recorded.
 Single-run figures elsewhere in this document should be read with the same
 caution.
+
+## Day 10
+
+**Goal:** Measure optimistic locking (version column + retry) against the
+single-statement and `FOR UPDATE` baselines, with particular attention to
+retry budget sizing rather than just latency.
+
+Environment: unchanged from Day 9 — macOS, Docker Desktop, 500 VUs, one
+iteration per VU, `MaxConns = 50`, k6 co-located. All figures from
+`scripts/bench.sh`.
+
+**Correctness — low contention (50 seats), both retry budgets:**
+
+| Strategy   | Retries budget | Bookings created | Failures | Failure type                  | Invariant                                    |
+| ---------- | -------------- | ---------------- | -------- | ----------------------------- | -------------------------------------------- |
+| optimistic | 5              | 9                | 491      | retry-exhausted, not sold-out | passes arithmetically; masks 41 unsold seats |
+| optimistic | 50             | 50               | 0        | —                             | holds genuinely                              |
+
+**Cost — p95 latency, low contention (50 seats):**
+
+| Strategy               | p95      |
+| ---------------------- | -------- |
+| single-statement       | 873 ms   |
+| `FOR UPDATE`           | 5.60 s   |
+| optimistic, retries=5  | 2.19 s\* |
+| optimistic, retries=50 | 5.63 s   |
+
+\*Not a comparable "cost of success" — this run had 491/500 requests fail
+outright. The p95 mostly reflects requests exhausting an undersized budget
+quickly, not resolving correctly.
+
+**Cost — winners vs losers, optimistic retries=50:**
+
+| Group                           | Count | p95               |
+| ------------------------------- | ----- | ----------------- |
+| Winners (booking created)       | 50    | 3.07 s            |
+| All requests (winners + losers) | 500   | 5.63 s            |
+| Total retries logged            | 2,476 | ~4.95 per request |
+
+**Why jitter alone didn't move the failure count.** Exponential backoff with
+full jitter was added between the two `retries=5` runs; the failure count
+stayed at 491 in both. Jitter solves lockstep — contenders retrying at the
+same instant and recolliding immediately. It does nothing about total attempts
+allowed. At a 500:50 contention ratio, a losing request needs to keep checking
+back in until one of 50 slots is actually claimed; well-spaced retries still
+run out if there are only 5 of them. Raising the budget, not the spacing, is
+what fixed it.
+
+**Caveat.** Only the 50-seat level has been re-measured this session with the
+tuned budget and real script output. 1-seat and 10-seat optimistic figures are
+not yet re-verified under `retries=50` and should not be cited until they are.
+
+**Variance.** An earlier, informally-cited p95 for this same 50-seat
+configuration (~6.82s) does not match this session's measured 5.63s. Consistent
+with Day 9's finding that single runs aren't measurements — median of three,
+with range recorded, before either number goes in a final comparison table.
