@@ -50,6 +50,9 @@ func (s *Store) InsertBooking(ctx context.Context, b *Booking) error {
 	`, b.UnitID, b.CustomerID, b.Qty, b.VisitDateTime,
 		b.TotalMinor, b.Currency, b.BookingStatus,
 	).Scan(&b.BookingID, &b.CreatedAt, &b.UpdatedAt)
+	if isSerializationFailure(err) {
+		return ErrSerializationFailure
+	}
 	if err != nil {
 		return fmt.Errorf("failed to insert booking: %w", err)
 	}

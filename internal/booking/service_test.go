@@ -57,6 +57,9 @@ type fakeStore struct {
 	releaseErr   error
 	releaseCalls int
 
+	serializableErrs  []error
+	serializableCalls int
+
 	withTxCalls int
 	withTxErr   error
 }
@@ -153,6 +156,15 @@ func (f *fakeStore) WithTx(ctx context.Context, fn func(Store) error) error {
 	f.withTxCalls++
 	if f.withTxErr != nil {
 		return f.withTxErr
+	}
+	return fn(f)
+}
+
+func (f *fakeStore) WithSerializableTx(ctx context.Context, fn func(Store) error) error {
+	i := f.serializableCalls
+	f.serializableCalls++
+	if i < len(f.serializableErrs) && f.serializableErrs[i] != nil {
+		return f.serializableErrs[i]
 	}
 	return fn(f)
 }
@@ -1056,6 +1068,7 @@ func TestServiceCreateOptimisticRetriesOnVersionConflict(t *testing.T) {
 		optimisticErrs: []error{storage.ErrVersionConflict, storage.ErrVersionConflict, nil},
 	}
 	svc := NewService(store, testLogger, false, "optimistic")
+	svc.maxOptimisticRetries = 3
 
 	got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
 	if err != nil {
@@ -1070,18 +1083,59 @@ func TestServiceCreateOptimisticRetriesOnVersionConflict(t *testing.T) {
 }
 
 func TestServiceCreateOptimisticExhaustsRetries(t *testing.T) {
-	errs := make([]error, maxOptimisticRetries)
+	const testRetries = 3
+
+	errs := make([]error, testRetries)
 	for i := range errs {
 		errs[i] = storage.ErrVersionConflict
 	}
 	store := &fakeStore{unit: testUnit(10, 10, 1), optimisticErrs: errs}
 	svc := NewService(store, testLogger, false, "optimistic")
+	svc.maxOptimisticRetries = testRetries
 
 	_, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
 	if !errors.Is(err, ErrTooManyRetries) {
 		t.Errorf("error: got %v, want %v", err, ErrTooManyRetries)
 	}
-	if got := svc.retries.Load(); got != int64(maxOptimisticRetries) {
-		t.Errorf("retries: got %d, want %d", got, maxOptimisticRetries)
+	if got := svc.retries.Load(); got != testRetries {
+		t.Errorf("retries: got %d, want %d", got, testRetries)
+	}
+}
+
+func TestServiceCreateSerializableRetriesOnSerializationFailure(t *testing.T) {
+	store := &fakeStore{
+		unit:             testUnit(10, 10, 1),
+		serializableErrs: []error{storage.ErrSerializationFailure, storage.ErrSerializationFailure, nil},
+	}
+	svc := NewService(store, testLogger, false, "serializable")
+
+	got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("booking: got nil, want a booking")
+	}
+	if svc.retries.Load() != 2 {
+		t.Errorf("retries: got %d, want 2", svc.retries.Load())
+	}
+}
+
+func TestServiceCreateSerializableExhaustsRetries(t *testing.T) {
+	const testRetries = 3
+	errs := make([]error, testRetries)
+	for i := range errs {
+		errs[i] = storage.ErrSerializationFailure
+	}
+	store := &fakeStore{unit: testUnit(10, 10, 1), serializableErrs: errs}
+	svc := NewService(store, testLogger, false, "serializable")
+	svc.maxSerializableRetries = testRetries
+
+	_, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if !errors.Is(err, ErrTooManyRetries) {
+		t.Errorf("error: got %v, want %v", err, ErrTooManyRetries)
+	}
+	if got := svc.retries.Load(); got != testRetries {
+		t.Errorf("retries: got %d, want %d", got, testRetries)
 	}
 }

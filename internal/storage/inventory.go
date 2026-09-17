@@ -38,6 +38,9 @@ func (s *Store) GetInventoryUnit(ctx context.Context, id uuid.UUID) (*InventoryU
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUnitNotFound
 	}
+	if isSerializationFailure(err) {
+		return nil, ErrSerializationFailure
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get inventory unit: %w", err)
 	}
@@ -53,6 +56,9 @@ func (s *Store) DecrementAvailabilityOptimistic(ctx context.Context, id uuid.UUI
 	`, qty, id, version)
 	if errors.As(err, &pgErr) && pgErr.ConstraintName == "chk_availability" {
 		return ErrSoldOut
+	}
+	if isSerializationFailure(err) {
+		return ErrSerializationFailure
 	}
 	if err != nil {
 		return fmt.Errorf("decrement availability: %w", err)
@@ -79,6 +85,9 @@ func (s *Store) DecrementAvailability(ctx context.Context, id uuid.UUID, qty int
 	`, qty, id)
 	if errors.As(err, &pgErr) && pgErr.ConstraintName == "chk_availability" {
 		return ErrSoldOut
+	}
+	if isSerializationFailure(err) {
+		return ErrSerializationFailure
 	}
 	if err != nil {
 		return fmt.Errorf("decrement availability: %w", err)
@@ -126,6 +135,9 @@ func (s *Store) GetInventoryUnitForUpdate(ctx context.Context, id uuid.UUID) (*I
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUnitNotFound
+	}
+	if isSerializationFailure(err) {
+		return nil, ErrSerializationFailure
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get inventory unit for update: %w", err)
