@@ -583,3 +583,67 @@ because of the log line. I added a late retry at the end to cover it.
 - Makefile target and CI job for the integration tests, and `go vet -tags=integration`
 - Storage coverage number
 - Why optimistic retries about 2.5× more than `SERIALIZABLE` in the same test
+
+## Day 13
+
+### What I built
+
+- The integration tests now run in CI, in their own job.
+- Makefile targets `test-integration` and `vet`.
+- ADR-002, the concurrency-control decision.
+
+### Prediction before measuring
+
+[fill in: did I expect the one-session run to confirm the old ranking?]
+
+### What happened
+
+It didn't. Single-statement and `SERIALIZABLE` came out tied, 864 ms against
+865 ms p95. Optimistic and `FOR UPDATE` form a slower tier, about 2–2.5× behind.
+
+The old gaps came from comparing numbers from different days. Today's
+`SERIALIZABLE` was 1.8× faster than Day 11's with the same code.
+
+### What I understand now
+
+**Only compare numbers from the same session.** The machine matters as much as
+the code. The quickest check is the fastest request: on Day 11 even that took
+495 ms, and today it took about 70 ms. If the floor moves, the conditions changed.
+
+**Know your noise.** The same code 20 minutes apart differed by 19%, so any gap
+smaller than that says nothing.
+
+**The first run lies.** The first run of the session was more than twice as slow
+as the next two. Do one warm-up run first.
+
+**A test can measure something other than what you meant.** In the 1-seat
+optimistic run, the winner finished before anyone else reached the database.
+There was no contention, just 499 fast rejections.
+
+**Why single-statement is enough.** "`available_units` never below 0" only
+concerns one row, so a `CHECK` constraint can enforce it. The relative decrement
+waits for the row lock, applies to the latest committed value, and either
+succeeds or hits the constraint. `SERIALIZABLE` is for rules across several rows,
+like a per-customer limit, where no single-row constraint can help.
+
+**When performance ties, guarantees decide.** Since the fast tier is tied, the
+choice between single-statement and `SERIALIZABLE` came down to what each can
+guarantee, not speed.
+
+### Things that went wrong
+
+- I almost wrote the ADR using the cross-day table. It would have said single-statement was 2× faster than `SERIALIZABLE`, which isn't true.
+- CI was pinned to Go 1.25 while I use 1.27 locally, and it had a Postgres service that nothing used.
+
+### Questions I should be able to answer
+
+- Why is one `UPDATE` enough for booking, but not for a per-customer limit?
+- Why can't the saga rely on the isolation level for consistency?
+- How do you know whether two benchmark numbers can be compared?
+- What would make you revisit ADR-002?
+
+### Still open
+
+- Integration job duration in CI
+- Why optimistic retries about 7× more than `SERIALIZABLE`
+- `CHECK (available_units <= total_units)`, before compensation in week 4

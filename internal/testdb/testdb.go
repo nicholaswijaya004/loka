@@ -90,12 +90,15 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
-func applyMigrations(connStr string) error {
+func applyMigrations(connStr string) (err error) {
 	m, err := migrate.New("file://"+repoPath("migrations"), connStr)
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() {
+		srcErr, dbErr := m.Close()
+		err = errors.Join(err, srcErr, dbErr)
+	}()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return err
