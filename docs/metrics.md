@@ -492,3 +492,82 @@ medians of three.
 - Optimistic (retries=50) at 1 and 10 seats
 - `SERIALIZABLE` medium contention ×3, and retry totals at 1 and 50 seats
 - Optimistic retry total at 50 seats, re-measured with the fixed script
+
+## Day 12
+
+**Goal:** Prove, against a real Postgres, the claims the fake store can't reach:
+constraint mapping, transaction rollback, `SERIALIZABLE` conflict detection
+(including `40001` at commit), and correctness of all four strategies and of
+idempotency under concurrency.
+
+Environment: Testcontainers for Go v0.44.0, `postgres:16-alpine`, real
+migrations from `migrations/`, `scripts/seed.sql` re-applied before every test.
+One container per package, started in `TestMain`. pgxpool default size. All
+concurrency tests run with `-race`. Shared harness in `internal/testdb`, behind
+`//go:build integration`, so `make test` still runs without Docker.
+
+**Suite:**
+
+| Package | Test                                               | Proves                                                                      | Runs | Result  |
+| ------- | -------------------------------------------------- | --------------------------------------------------------------------------- | ---- | ------- |
+| storage | `TestDecrementAvailabilityRejectsOverbooking`      | `chk_availability` maps to `ErrSoldOut`; failed call writes nothing         | 1    | ✓       |
+| storage | `…UnknownUnit` (decrement, get, optimistic)        | missing unit is `ErrUnitNotFound`, never a conflict                         | 1    | ✓       |
+| storage | `TestDecrementAvailabilityOptimisticStaleVersion`  | stale version is `ErrVersionConflict`; stale write doesn't land             | 1    | ✓       |
+| storage | `TestTx*` × `WithTx`, `WithSerializableTx`         | rollback, commit, isolation until commit, nesting refused                   | 1    | ✓       |
+| storage | `TestSerializableConcurrentUpdateBlocksThenAborts` | T2 waits on T1's row lock, then gets `40001`                                | 10   | 10/10 ✓ |
+| storage | `TestSerializableWriteSkew` (both commit orders)   | read-write cycle fails the loser at `COMMIT`                                | 10   | 20/20 ✓ |
+| booking | `TestCreateUnderContentionAllStrategies`           | 50 workers, 10 seats: exactly 10 booked, rest `ErrSoldOut`, invariant holds | 5    | 20/20 ✓ |
+| booking | `TestCreateIdempotentConcurrentSameKey`            | 50 workers, one key: exactly one booking; a late retry replays it           | 13   | 13/13 ✓ |
+
+**Coverage:** `internal/storage` [TODO: `go test -tags=integration -cover ./internal/storage/`].
+
+**Constraint-name experiment.** With `"chk_availability"` misspelled in
+`DecrementAvailability`:
+
+- `go test ./internal/booking/` — all green, 100% coverage.
+- The storage integration test fails with
+  `decrement availability: ERROR: new row for relation "inventory_units" violates check constraint "chk_availability" (SQLSTATE 23514)`.
+
+The unrecognised error falls through the service unchanged, so a sold-out request
+would return 500 instead of 409. The fake store can't catch this: it returns
+whatever error the test configures, so the mapping is never exercised.
+
+**Where `SERIALIZABLE` fails:**
+
+| Scenario                             | Conflict         | Where `40001` fires  | Winner          |
+| ------------------------------------ | ---------------- | -------------------- | --------------- |
+| Two transactions update the same row | write-write      | the waiting `UPDATE` | first updater   |
+| Each reads one row, writes the other | read-write cycle | the loser's `COMMIT` | first committer |
+
+In the write-skew case no statement fails, so only the commit-time mapping in
+`WithSerializableTx` turns it into `ErrSerializationFailure`.
+
+**Contention test, per strategy (5 runs, `-race`):**
+
+| Strategy              | Duration    | Retries |
+| --------------------- | ----------- | ------- |
+| single-statement      | 1.12–1.77 s | 0       |
+| `FOR UPDATE`          | 1.12–1.67 s | 0       |
+| optimistic (r=50)     | 3.44–6.25 s | 278–307 |
+| `SERIALIZABLE` (r=50) | 1.18–1.86 s | 115–126 |
+
+These are harness numbers, not benchmarks: the pool caps concurrency at
+`max(4, NumCPU)`, so real contention is pool size, not 50. Don't compare them
+with the `bench.sh` tables. The stable ~2.5× gap between optimistic and
+`SERIALIZABLE` retries is noted as an open question below, not a finding.
+
+**Idempotency split:** every one of 13 runs was `fresh=1 replays=0 in-flight=49`.
+The start gate releases all 50 at once, so every loser checks the key before the
+winner completes. The concurrent part of the test never exercised replay; a
+sequential late retry was added to cover it.
+
+**Timing:** container start 4–13 s on Docker Desktop, dominating every run.
+Storage tests take ~0.6 s in total, write skew ~50 ms per commit order,
+block-then-abort ~80 ms after warm-up.
+
+**Open:**
+
+- `make test-integration` and a CI job running it, plus `go vet -tags=integration`
+- Storage coverage figure
+- Why optimistic retries ~2.5× more than `SERIALIZABLE` under the same load:
+  the read-to-write gap, the extra disambiguation read, or both

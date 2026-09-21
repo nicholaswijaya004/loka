@@ -479,3 +479,107 @@ fail shouldn't wait up to 2 s first.
 - `SERIALIZABLE` medium ×3, plus retry counts at 1 and 50 seats
 - The commit-time `40001` path has no automated test. The fake store never
   commits. That needs an integration test against real Postgres.
+
+## Day 12
+
+### What I built
+
+Integration tests that run against a real Postgres started by the test itself.
+Testcontainers launches `postgres:16-alpine`, the real migrations get applied, and
+every test resets the tables and re-applies the seed. The setup lives in
+`internal/testdb` so `storage` and `booking` share it, and everything is behind
+`//go:build integration`, so `make test` still works without Docker.
+
+Tests, in the order I wrote them:
+
+- constraint and not-found mapping in `storage`
+- `WithTx` and `WithSerializableTx`: rollback, commit, invisible until commit, nesting refused
+- `SERIALIZABLE` block-then-abort
+- `SERIALIZABLE` write skew, in both commit orders
+- all four strategies with 50 goroutines on 10 seats
+- 50 goroutines retrying one idempotency key
+
+### Prediction before measuring
+
+Write skew: I guessed the error would fire at T2's `COMMIT`, and that whichever
+transaction commits first wins.
+
+### What happened
+
+Both parts were right. The loser always failed at `COMMIT`, in both commit
+orders, 20 out of 20. No statement failed on either side.
+
+My reason was wrong, though. I said it's because `SERIALIZABLE` throws everything
+away, but that's what happens after the failure, not why it happens.
+
+Everything else passed repeatedly under `-race`. No strategy oversold, and
+concurrent retries of one key produced exactly one booking.
+
+### What I understand now
+
+**Coverage doesn't mean the code works.** I misspelled `"chk_availability"` on
+purpose. `booking` stayed green at 100% coverage. The integration test failed with
+a raw `SQLSTATE 23514`, which my handler would turn into a 500 instead of a 409.
+The fake store returns whatever error I tell it to, so it can never check that I
+recognise the error Postgres actually sends.
+
+**Why write skew fails at commit.** Under `SERIALIZABLE`, every read leaves a
+marker that doesn't block anyone. T1 wrote the row T2 had read, so T2 has to come
+before T1. T2 wrote the row T1 had read, so T1 has to come before T2. That's a
+cycle, and no serial order exists. Postgres doesn't abort when the cycle forms,
+because nobody has committed yet. When one side commits, the other is marked
+doomed and fails at its own `COMMIT`.
+
+**Two different ways to get `40001`:**
+
+- Same row, write vs write: the second `UPDATE` waits, then fails. First updater wins.
+- Different rows, read vs write cycle: nobody waits, the loser fails at `COMMIT`. First committer wins.
+
+My code can't tell them apart, which is why the retry wraps the whole transaction.
+The second kind is also the only reason the commit-time mapping in
+`WithSerializableTx` exists, and until today nothing tested it.
+
+**The pool is where `FOR UPDATE` waits.** The pool only has `max(4, NumCPU)`
+connections, not 50. That doesn't deadlock, because the transaction holding the
+row lock already has its connection and will commit. The other goroutines wait in
+`pgxpool.Acquire` instead of in Postgres. It also means my harness retry counts
+aren't benchmark numbers.
+
+**`TestMain` runs once per package, and I never call it.** `go test` calls it,
+and `m.Run()` is what runs the tests. That's why the container is shared, and why
+every test has to reset the data.
+
+**Proving a goroutine is blocked.** I poll `pg_stat_activity` until the process
+shows `wait_event_type = 'Lock'` instead of sleeping. With `sleep`, the test
+would pass on my laptop and flake on a slow CI runner.
+
+**A green test can still skip a branch.** The idempotency test passed ten times,
+but the log said `replays=0` every time. All 49 losers arrived while the winner
+was still working, so they all got in-flight. The replay path, which is the
+"response got lost and the client retried" case, was never run. I only noticed
+because of the log line. I added a late retry at the end to cover it.
+
+### Things that went wrong
+
+- My first `TestMain` had `testDB, err := ...`, which created a new local variable and left the package one `nil`.
+- `defer` in `TestMain` never ran, because `os.Exit` skips deferred calls. Fixed by moving setup into a `run()` function that returns.
+- `//go:embed` can't reach `migrations/` from `internal/storage`, since it only embeds files at or below the package directory. Switched to a `file://` path.
+- I called `Restore` with no `Snapshot`, on a container variable I'd never assigned. Switched to truncate and reseed, which also avoids fighting the pool's open connections.
+- My overbooking test used the 10-seat unit, so the second decrement just succeeded. It needs the 1-seat one.
+- I printed the whole struct with `%d` instead of `unit.AvailableUnits`. That kind of bug only shows up when the test fails, which is exactly when the message matters.
+- Neovim said "no packages found" for the test files. gopls ignores files behind a build tag unless it's told about the tag.
+
+### Questions I should be able to answer
+
+- Why can't a unit test with a fake store catch a misspelled constraint name?
+- What are the two ways `SERIALIZABLE` produces `40001`, and where does each one fire?
+- Why does Postgres wait until commit to abort the write-skew loser?
+- Why doesn't `FOR UPDATE` deadlock when the pool is smaller than the number of goroutines?
+- Why reset data between tests instead of starting a container per test?
+- How do you prove in a test that a transaction is actually waiting on a lock?
+
+### Still open
+
+- Makefile target and CI job for the integration tests, and `go vet -tags=integration`
+- Storage coverage number
+- Why optimistic retries about 2.5× more than `SERIALIZABLE` in the same test
