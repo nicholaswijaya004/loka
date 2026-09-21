@@ -1,4 +1,4 @@
-.PHONY: run build test up down psql migrate-up migrate-down migrate-version migrate-force seed reset
+.PHONY: run build test test-integration vet up down psql migrate-up migrate-down migrate-version migrate-force seed reset
 
 run:
 	go run ./cmd/api
@@ -46,3 +46,10 @@ reset:
 
 seed:
 	docker compose exec -T postgres psql -U loka -d loka < scripts/seed.sql
+
+test-integration:
+	go test -race -tags=integration -count=1 ./...
+
+vet:
+	go vet ./...
+	go vet -tags=integration ./...

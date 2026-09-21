@@ -571,3 +571,68 @@ block-then-abort ~80 ms after warm-up.
 - Storage coverage figure
 - Why optimistic retries ~2.5× more than `SERIALIZABLE` under the same load:
   the read-to-write gap, the extra disambiguation read, or both
+
+## Day 13
+
+**Goal:** Run the integration tests in CI, fill the empty cells in the strategy
+comparison, and record the decision in ADR-002.
+
+**CI.** Added `make test-integration` and `make vet` (vet runs with and without
+the `integration` tag), plus an `integration` job on `ubuntu-latest`. Lint runs
+with `--build-tags=integration`. Also removed an unused Postgres service from the
+`build` job, and CI now reads the Go version from `go.mod`.
+Integration job duration: [TODO: from the Actions tab].
+
+**The one-session table.** All four strategies, 10 seats, 500 VUs, three runs
+each, back to back (14:04–14:07), median shown:
+
+| Strategy          | p95    | p95 range       | req/s | Retries |
+| ----------------- | ------ | --------------- | ----- | ------- |
+| single-statement  | 864 ms | 792 ms – 1.94 s | 473   | 0       |
+| `SERIALIZABLE`    | 865 ms | 811 – 905 ms    | 539   | 144     |
+| optimistic (r=50) | 1.91 s | 1.74 – 1.92 s   | 244   | 1,070   |
+| `FOR UPDATE`      | 2.14 s | 2.00 – 2.27 s   | 202   | 0       |
+
+Every run sold all 10 seats, and the invariant held.
+
+**Two tiers, not four places.** Single-statement and `SERIALIZABLE` are tied.
+Optimistic and `FOR UPDATE` are close to each other, about 2.2–2.5× slower.
+
+**Earlier comparisons are withdrawn.** Days 9–11 put single-statement about 2×
+ahead of `SERIALIZABLE`, and `FOR UPDATE` 8.5× behind single. Those tables mixed
+numbers from different days. The same `SERIALIZABLE` code measured 1.31 s p95 on
+Day 11 and 729–865 ms today. The clue was the fastest request: 495 ms on Day 11,
+against 47–97 ms today. That points at the machine, not the strategy.
+
+**Noise floor.** Two `SERIALIZABLE` sessions 20 minutes apart:
+
+| Session | Median p95 | Median req/s | Median retries |
+| ------- | ---------- | ------------ | -------------- |
+| 13:48   | 729 ms     | 589          | 100            |
+| 14:06   | 865 ms     | 539          | 144            |
+
+That's about 19% drift on identical code. On this laptop, gaps under ~20% are noise.
+
+**Warm-up.** The first run of the session (single-statement, run 1) had p95 1.94 s,
+against 792 and 864 ms for runs 2 and 3. The median absorbs it. Future sessions
+should start with one untimed run.
+
+**Optimistic, previously empty cells:**
+
+| Seats | p95    | req/s | Retries |
+| ----- | ------ | ----- | ------- |
+| 1     | 417 ms | 999   | 0       |
+| 10    | 1.33 s | 362   | 1,087   |
+
+These are single runs, from before the one-session batch.
+
+**The 1-seat run tested no contention.** The only winner took 34 ms, which was
+also the minimum latency of all 500 requests, and there were 0 retries. It
+finished before most requests reached the database, so the row measures how fast
+sold-out requests are rejected, not how conflicts are handled.
+
+**Retries.** Optimistic retried about 7× more than `SERIALIZABLE` under the same
+load (1,070 against 144). The integration harness showed the same direction at
+2.5×. Still unexplained.
+
+**Decision:** see `ADR-002-concurrency-control.md`.
