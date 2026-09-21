@@ -154,18 +154,18 @@ strategies.
 Every invariant that can be expressed as a constraint is expressed as one. The
 application is treated as untrusted.
 
-| Invariant | Mechanism |
-|---|---|
-| Availability can never go negative or exceed capacity | `CHECK (available_units >= 0 AND available_units <= total_units)` |
-| A booking can never be charged twice | Partial unique index on `payments (booking_id) WHERE payment_status = 'succeeded'` |
-| A retried request cannot create a second booking | `idempotency_key` as primary key; insert-first claims the request |
-| A booking cannot hold an invalid status | `CHECK (booking_status IN ('pending','confirmed','cancelled'))` |
-| A booking cannot be both confirmed and cancelled | `CHECK (NOT (confirmed_at IS NOT NULL AND cancelled_at IS NOT NULL))` |
+| Invariant                                             | Mechanism                                                                          |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Availability can never go negative or exceed capacity | `CHECK (available_units >= 0 AND available_units <= total_units)`                  |
+| A booking can never be charged twice                  | Partial unique index on `payments (booking_id) WHERE payment_status = 'succeeded'` |
+| A retried request cannot create a second booking      | `idempotency_key` as primary key; insert-first claims the request                  |
+| A booking cannot hold an invalid status               | `CHECK (booking_status IN ('pending','confirmed','cancelled'))`                    |
+| A booking cannot be both confirmed and cancelled      | `CHECK (NOT (confirmed_at IS NOT NULL AND cancelled_at IS NOT NULL))`              |
 
 The partial unique index deserves particular note. A plain
 `UNIQUE (booking_id)` on `payments` would be wrong: payment attempts legitimately
 repeat after a decline or timeout, and that history is worth keeping. What must
-be unique is the *successful* attempt. Postgres supports uniqueness over a
+be unique is the _successful_ attempt. Postgres supports uniqueness over a
 subset of rows:
 
 ```sql
@@ -214,12 +214,14 @@ default. Column names carry the unit (`price_minor`, `total_minor`,
 `bookings.total_minor`. These legitimately diverge — partial payments, refunds,
 post-hoc amendments to a booking — and a financial record should be
 self-contained enough to reconcile against a provider statement without a join.
-Where they *should* agree, storing both allows the equality to be asserted; the
+Where they _should_ agree, storing both allows the equality to be asserted; the
 Week 4 chaos test does exactly that.
 
 ---
 
 ## Decision 4 — Optimistic concurrency control via a `version` column
+
+_Revised 2026-09-11 in light of the day 5 measurements._
 
 `inventory_units` carries a `version integer`, incremented on every update.
 Writes take the form:
@@ -240,12 +242,27 @@ transaction.
 **Chosen:** both are implemented, because the point of this project is to
 measure the difference rather than assert it.
 
-**Hypothesis to be tested (Days 8–10):** optimistic locking wins at low
-contention, where retries are rare and lock-waiting is pure overhead; pessimistic
-locking wins at high contention, where the retry rate makes optimistic writes
-waste more work than waiting would have cost. `SERIALIZABLE` isolation is
-measured as a third data point. This is a hypothesis, not a finding — the
-benchmark table in `docs/metrics.md` will record what actually happens.
+**Original hypothesis.** Optimistic locking wins at low contention, pessimistic
+at high, with correctness as the thing being bought.
+
+**What measurement showed.** The correctness premise was wrong. A single-statement
+`UPDATE ... SET available_units = available_units - $1` combined with
+`CHECK (available_units >= 0)` already prevents overselling entirely: 500
+concurrent requests against 10 seats produced exactly 10 bookings. Postgres
+evaluates the subtraction against the current committed value under a row lock,
+so a stale application-side read cannot corrupt the write.
+
+**Revised question.** All four candidate strategies are correct. What do they cost?
+
+| Strategy                 | Correct?       | Open question                                               |
+| ------------------------ | -------------- | ----------------------------------------------------------- |
+| Single statement + CHECK | yes (measured) | baseline                                                    |
+| `SELECT FOR UPDATE`      | yes            | does serialising contenders cost more than it saves?        |
+| `version` column + retry | yes            | at what contention does retry waste exceed lock waiting?    |
+| `SERIALIZABLE`           | yes            | what is the serialization-failure rate under this workload? |
+
+The `version` column is retained because the comparison requires it. Days 8–10
+measure throughput, p99, and retry rate for each at low and high contention.
 
 ---
 
@@ -256,7 +273,7 @@ and phone onto each booking.
 
 **Accepted consequence, and it is a real one:** if a customer updates their email
 address, every historical booking now displays the new address. Invoices,
-receipts, and shipping records conventionally *copy* contact details for exactly
+receipts, and shipping records conventionally _copy_ contact details for exactly
 this reason — a historical record should reflect what was true when it was
 created, not what is true now.
 
