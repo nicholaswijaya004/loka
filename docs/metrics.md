@@ -636,3 +636,67 @@ load (1,070 against 144). The integration harness showed the same direction at
 2.5×. Still unexplained.
 
 **Decision:** see `ADR-002-concurrency-control.md`.
+
+## Day 14
+
+**Goal:** Run Kafka locally, learn its behaviour from experiments rather than
+docs, and understand why "write to the database, then publish" is broken.
+
+Environment: `apache/kafka:4.0.0` in Docker Compose, single node in KRaft mode
+(broker and controller in one process), heap capped at 512 MB. Topic
+`booking-events`, 3 partitions, replication factor 1. Go client: franz-go.
+Demo program: `cmd/kafkademo`.
+
+**Experiment 1: the key decides the partition.**
+
+| Key                             | CLI producer (Java) | Go producer (franz-go) |
+| ------------------------------- | ------------------- | ---------------------- |
+| booking-1, booking-2, booking-5 | 0                   | 0                      |
+| booking-3, booking-4            | 2                   | 2                      |
+| booking-6                       | 1                   | —                      |
+
+Both clients hash keys the same way, so services written in different languages
+agree on where each booking's events go. Within a partition, order held every
+time. Across partitions it didn't: the consumer printed `booking-3 paid` (the
+last message produced) before `booking-1 created` (the first).
+
+Offsets are counted per partition. Partition 2 ran 0–8 while partition 0 ran
+0–17, so an offset means nothing without its partition.
+
+**Experiment 2: a crash before the commit means redelivery.**
+
+Auto-commit disabled, and the process exits between printing and committing.
+
+| Partition | Committed after crash | Log end | Lag |
+| --------- | --------------------- | ------- | --- |
+| 0         | 12                    | 15      | 3   |
+| 2         | 5                     | 7       | 2   |
+
+On restart, the same 5 messages (offsets 12–14 and 5–6) were delivered again,
+and after that commit the lag was 0 on every partition. This is at-least-once
+delivery.
+
+The first restart printed nothing. The crashed consumer never left the group,
+because `os.Exit` skipped `Close()`, so its partitions stayed assigned to a dead
+member until its session timeout expired (about 45 s by default).
+
+**Experiment 3: rebalancing.**
+
+- One consumer got `[0 1 2]`. When a second joined, the first gave up only
+  partition 2 and kept 0 and 1, a 2/1 split. The split is sticky: partitions
+  move only when they have to.
+- franz-go's default rebalance is cooperative: the first consumer kept
+  processing 0 and 1 while 2 was being moved.
+- On Ctrl-C (a clean shutdown), the leaving consumer's partitions reached the
+  other one in about a second. After the crash in experiment 2, they sat idle
+  for about 45 s. Same partitions, same group; only the shutdown differed.
+
+**`--from-beginning` vs committed offsets.** A group with a committed position
+ignores `--from-beginning`. That flag, and franz-go's `ConsumeResetOffset`, only
+apply when the group has no committed offset. A group re-run after committing
+read 5 new messages, not all 13.
+
+**Open:**
+
+- Check `outbox_events` against the columns the outbox pattern needs,
+  especially a key column (`aggregate_id`) for per-booking ordering

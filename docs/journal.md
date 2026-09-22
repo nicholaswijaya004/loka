@@ -647,3 +647,91 @@ guarantee, not speed.
 - Integration job duration in CI
 - Why optimistic retries about 7× more than `SERIALIZABLE`
 - `CHECK (available_units <= total_units)`, before compensation in week 4
+
+## Day 14
+
+### What I built
+
+- Kafka running locally in Docker Compose, in KRaft mode, with no ZooKeeper.
+- `cmd/kafkademo`, a small franz-go program that produces keyed events and consumes them in a consumer group, with manual commits and a switch to simulate a crash.
+
+It's my first time using Kafka.
+
+### Prediction before measuring
+
+Is it safe to publish to Kafka inside the database transaction, before `COMMIT`?
+[fill in: what I guessed]
+
+### What happened
+
+Three experiments, all run for real:
+
+- The same key always went to the same partition, and the Go client agreed with the Java CLI on every key.
+- Crashing before the commit meant the same messages came back on restart. The first restart also sat idle for about 45 seconds first.
+- Adding a second consumer moved only one partition. Stopping a consumer cleanly handed its partitions over in about a second.
+
+### What I understand now
+
+**The six basics:**
+
+- A topic is an append-only log. Reading doesn't remove anything.
+- A topic is split into partitions, and order only holds within a partition.
+- The key picks the partition, so keying events by `booking_id` keeps one booking's events in order.
+- An offset is a position within one partition.
+- In a consumer group, each partition goes to exactly one consumer, so the partition count sets the maximum parallelism.
+- Committing an offset saves progress. Crash before committing and you get the message again.
+
+**Kafka is at-least-once. Handling duplicates is my job.** The message came back
+after the crash, and nothing marked it as a repeat. Later this week I'll build an
+idempotent consumer, which is Day 6's idempotency keys again, applied to messages.
+
+**A crash and a clean shutdown aren't the same even when no data is lost.** After
+the crash, the partitions stayed idle until the dead consumer's session timed
+out. After Ctrl-C, they moved in about a second. That's why handling the shutdown
+signal and closing the client properly matters.
+
+**A committed offset beats `--from-beginning`.** The reset setting only applies
+to a group that has never committed.
+
+**Why writing to the database and then publishing is broken:**
+
+1. The database commits, then the publish fails or the process crashes. The event is lost forever and nothing retries it. Downstream never hears about a real booking, and nobody notices.
+2. The publish succeeds, then the database rolls back. Consumers act on a booking that doesn't exist.
+
+Publishing inside the transaction before `COMMIT` doesn't help, because the
+commit can still fail afterwards, and a message can't be un-sent. It also holds
+locks during a network call. There are two systems with no shared commit, so
+every ordering can fail.
+
+**The outbox fixes it by making it one system.** The event is written as a row
+in the same transaction as the booking. A relay publishes it later and marks it
+sent. If the relay crashes, it sends the row again. That's at-least-once, so
+consumers deduplicate.
+
+### What I got wrong
+
+- I thought 5 consumers on 3 partitions meant 2 would work. It's the reverse: 3 work and 2 sit idle.
+- I said a consumer restarts from where it failed. It restarts from the last committed offset, so it processes the uncommitted messages again.
+- I said the key "keeps track" of the booking. The real point is ordering: same key, same partition, same order.
+- I claimed franz-go gives more control over commits than kafka-go. Both support manual commits. The real differences are the API shape and franz-go's fuller protocol support (transactions, exactly-once), which Loka doesn't need.
+
+### Things that went wrong
+
+- `kafka:` was indented under `postgres:` in the Compose file, which gave `Additional property kafka is not allowed`. `docker compose config` catches this without starting anything.
+- zsh read `(healthy)` in a pasted comment as a file pattern. Fixed with `setopt interactivecomments`.
+- An empty line in the console producer crashed it, because every line needs the `key:` separator. End input with Ctrl-D.
+- My first Go version was the franz-go README example with `package kafkademo`, a `WaitGroup` that was never marked done (so it hung), topic `foo`, and a typo `booking-event` that would have auto-created a stray topic.
+- I first put the crash check at the start of `run()`, where it exits before consuming anything, so it proved nothing.
+
+### Questions I should be able to answer
+
+- Why does the partition count limit consumer parallelism?
+- Why key events by `booking_id`?
+- What does at-least-once mean, and where did I see it happen?
+- Why did a crash delay the handover by about 45 seconds when Ctrl-C didn't?
+- Why is "write to the database, then publish" broken in both orders?
+- How does the outbox pattern avoid it, and why does it still need an idempotent consumer?
+
+### Still open
+
+- Check `outbox_events` against the outbox pattern: an event `id`, an ordering column, `aggregate_id` for the key, `published_at`, and a partial index on unpublished rows
