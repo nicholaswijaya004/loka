@@ -735,3 +735,93 @@ consumers deduplicate.
 ### Still open
 
 - Check `outbox_events` against the outbox pattern: an event `id`, an ordering column, `aggregate_id` for the key, `published_at`, and a partial index on unpublished rows
+
+## Day 15
+
+### What I built
+
+- **Booking writes its event.** Every booking now writes a `booking.created` event into `outbox_events` in the same transaction, through one helper that all four strategies share.
+- **`cmd/relay`,** a separate program that picks up unpublished events, sends them to Kafka keyed by `booking_id`, and marks them published.
+- **A comment in `idempotency.go`** explaining why a key that vanished mid-race maps to `ErrRequestInFlight`.
+
+### Prediction before measuring
+
+After the relay crashes between publishing and marking:
+
+- `published_at` for the 3 events: [fill in]
+- messages the consumer sees after the normal relay runs: [fill in]
+
+### What happened
+
+After the crash, all 3 events were still unpublished in the database, even
+though Kafka already had them. The transaction rolled back. The normal relay
+then sent them again: 6 messages in Kafka, 3 of them duplicates with the same
+`event_id`. Nothing was lost.
+
+### What I understand now
+
+**The outbox turns two systems into one.** The booking and its event are rows in
+the same database, written in the same transaction, so either both exist or
+neither does. Only the relay talks to Kafka, and it can retry forever.
+
+**Set `published_at` after publishing, not before:**
+
+- Marking first and then crashing loses the event.
+- Publishing first and then crashing duplicates it.
+
+A duplicate can be handled; a loss can't.
+
+**`FOR UPDATE SKIP LOCKED` is the job-queue pattern.** Two relays never take the
+same rows, and neither waits for the other. A relay that dies holding locks
+loses nothing, because its transaction rolls back and the rows are free again.
+
+**Stop the batch at the first failure.** If event 2 fails and event 3 is for the
+same booking, sending 3 anyway means a consumer could see "confirmed" before
+"created". Stopping keeps the order, at the cost of one bad event blocking the
+rest until it succeeds.
+
+**A sequence number isn't commit order.** A slow transaction can get id 5 and
+commit after id 6. A relay that asks for `id > last_seen` skips 5 forever. Mine
+asks for `published_at IS NULL`, so 5 is picked up late but never lost.
+
+**Go interfaces are implicit.** `KafkaPublisher` becomes a `Publisher` just by
+having a `Publish` method. The compiler only checks where it's used as one,
+which is why `var _ Publisher = (*KafkaPublisher)(nil)` is worth adding: it moves
+the check next to the type, like Java's `implements`.
+
+**`Query` vs `QueryRow`.** `QueryRow` is one row, so `Scan` can go straight on
+it. `Query` is a cursor: check the error, `defer rows.Close()`, loop with
+`Next`/`Scan`, then check `rows.Err()`. An unclosed `rows` inside a transaction
+blocks the next statement on that connection.
+
+**`jsonb` reorders keys and changes whitespace.** Consumers must not compare
+payloads as raw bytes.
+
+**`now()` is the time the transaction started.** That's why a batch shares one
+`published_at`.
+
+### Things that went wrong
+
+- I passed `s.store` instead of `tx` to `insertBookingWithEvent` in all four strategies. The booking would have committed on its own connection, outside the transaction, which on a `SERIALIZABLE` retry means a duplicate booking. The unit tests passed anyway, because in the fake store the transaction _is_ the store. The integration test with an injected outbox failure is what catches it.
+- My fake `InsertOutboxEvent` first reused the `InsertBooking` counter and error.
+- The aggregate type was `"booking_created"`. It should be `"booking"`, the same for every event about a booking.
+- After `make reset` the topic didn't exist, and franz-go doesn't auto-create it. The relay kept retrying and lost nothing, which turned into a good test. `make reset` now creates the topic.
+- I read an event's `attempt_number = 0` as a bug in failure recording, but the database had been reset and it was a different event. The relay test settled it: recording works.
+- In `main.go` I set an unexported field (`r.afterPublish`) from another package, which doesn't compile, so I added a setter. The crash hook also fired on empty polls until I added `len(sent) > 0`.
+
+### Questions I should be able to answer
+
+- Why is "write to the database, then publish" broken, and how does the outbox fix it?
+- Why set `published_at` after publishing rather than before?
+- What does `SKIP LOCKED` do, and why does the relay need it?
+- Why can a relay using `id > last_seen` lose events?
+- Why does the batch stop at the first failure?
+- Where do duplicates come from, and what does a consumer need in order to handle them?
+- Why can't the fake store catch the `s.store` vs `tx` bug?
+
+### Still open
+
+- Idempotent consumer (Day 16)
+- Dead-letter handling for an event that fails forever
+- Server-side re-claim when a released idempotency key is found
+- Per-booking ordering with more than one relay

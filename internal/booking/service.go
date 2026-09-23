@@ -2,7 +2,9 @@ package booking
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync/atomic"
@@ -15,6 +17,9 @@ import (
 const (
 	defaultMaxOptimisticRetries   = 50
 	defaultMaxSerializableRetries = 50
+	bookingAggregate              = "booking"
+	bookingCreatedVersion         = 1
+	eventBookingCreated           = "booking.created"
 )
 
 type Service struct {
@@ -26,6 +31,19 @@ type Service struct {
 
 	maxOptimisticRetries   int
 	maxSerializableRetries int
+}
+
+type bookingCreatedPayload struct {
+	Version       int       `json:"version"`
+	BookingID     uuid.UUID `json:"booking_id"`
+	UnitID        uuid.UUID `json:"unit_id"`
+	CustomerID    uuid.UUID `json:"customer_id"`
+	Qty           int       `json:"qty"`
+	VisitDateTime time.Time `json:"visit_date_time"`
+	TotalMinor    int64     `json:"total_minor"`
+	Currency      string    `json:"currency"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string) *Service {
@@ -53,6 +71,7 @@ type Store interface {
 	ReleaseIdempotencyKey(ctx context.Context, key string) error
 	WithTx(ctx context.Context, fn func(Store) error) error
 	WithSerializableTx(ctx context.Context, fn func(Store) error) error
+	InsertOutboxEvent(ctx context.Context, o *storage.Outbox) error
 }
 
 func (s *Service) waitWithBackoff(ctx context.Context, attempt int) bool {
@@ -95,6 +114,35 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
 }
 
+func (s *Service) insertBookingWithEvent(ctx context.Context, tx Store, b *storage.Booking) error {
+	if err := tx.InsertBooking(ctx, b); err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(bookingCreatedPayload{
+		Version:       bookingCreatedVersion,
+		BookingID:     b.BookingID,
+		UnitID:        b.UnitID,
+		CustomerID:    b.CustomerID,
+		Qty:           b.Qty,
+		VisitDateTime: b.VisitDateTime,
+		TotalMinor:    b.TotalMinor,
+		Currency:      b.Currency,
+		Status:        b.BookingStatus,
+		CreatedAt:     b.CreatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal booking.created payload: %w", err)
+	}
+
+	return tx.InsertOutboxEvent(ctx, &storage.Outbox{
+		AggregateType: bookingAggregate,
+		AggregateID:   b.BookingID,
+		EventType:     eventBookingCreated,
+		Payload:       payload,
+	})
+}
+
 func (s *Service) createSerializable(ctx context.Context, unitID, customerID uuid.UUID, qty int, visitDateTime time.Time) (*storage.Booking, error) {
 	var booking *storage.Booking
 
@@ -123,7 +171,7 @@ func (s *Service) createSerializable(ctx context.Context, unitID, customerID uui
 			if err := tx.DecrementAvailability(ctx, unitID, qty); err != nil {
 				return err
 			}
-			return tx.InsertBooking(ctx, booking)
+			return s.insertBookingWithEvent(ctx, tx, booking)
 		})
 
 		if errors.Is(err, storage.ErrSerializationFailure) {
@@ -173,7 +221,7 @@ func (s *Service) createOptimistic(ctx context.Context, unitID, customerID uuid.
 			if err := tx.DecrementAvailabilityOptimistic(ctx, unitID, qty, unit.Version); err != nil {
 				return err
 			}
-			return tx.InsertBooking(ctx, booking)
+			return s.insertBookingWithEvent(ctx, tx, booking)
 		})
 
 		if errors.Is(err, storage.ErrVersionConflict) {
@@ -230,7 +278,7 @@ func (s *Service) createForUpdate(ctx context.Context, unitID, customerID uuid.U
 				return err
 			}
 		}
-		return tx.InsertBooking(ctx, booking)
+		return s.insertBookingWithEvent(ctx, tx, booking)
 	})
 
 	if errors.Is(err, storage.ErrSoldOut) {
@@ -277,7 +325,7 @@ func (s *Service) createSingleStatement(ctx context.Context, unitID, customerID 
 				return err
 			}
 		}
-		return tx.InsertBooking(ctx, booking)
+		return s.insertBookingWithEvent(ctx, tx, booking)
 	})
 
 	if errors.Is(err, storage.ErrSoldOut) {

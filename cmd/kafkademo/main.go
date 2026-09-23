@@ -9,7 +9,6 @@
 //	go run ./cmd/kafkademo produce
 //	go run ./cmd/kafkademo consume
 //	CRASH_BEFORE_COMMIT=1 go run ./cmd/kafkademo consume   # exit before committing
-
 package main
 
 import (
@@ -111,6 +110,9 @@ func consume(ctx context.Context) error {
 		fetches.EachRecord(func(r *kgo.Record) {
 			fmt.Printf("key=%s partition=%d offset=%d value=%s\n",
 				r.Key, r.Partition, r.Offset, r.Value)
+			for _, h := range r.Headers {
+				fmt.Printf("  %s=%s\n", h.Key, h.Value)
+			}
 		})
 
 		if os.Getenv("CRASH_BEFORE_COMMIT") == "1" {

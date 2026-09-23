@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/nicholaswijaya004/loka/internal/storage"
-	"time"
 )
 
 func (s *Service) CreateIdempotent(
@@ -23,6 +24,9 @@ func (s *Service) CreateIdempotent(
 
 	if !claimed {
 		existing, err := s.store.GetIdempotencyKey(ctx, key)
+		// We lost the claim, but the key is gone: the winner failed and released it
+		// between our INSERT and this lookup. The key is free again, so tell the
+		// client to retry (409) rather than reporting a missing key.
 		if errors.Is(err, storage.ErrIdempotencyKeyNotFound) {
 			return nil, false, ErrRequestInFlight
 		}
