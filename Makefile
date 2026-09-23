@@ -41,8 +41,16 @@ reset:
 		sleep 1; \
 	done; \
 	echo "Postgres not ready after 30s" >&2; exit 1
-	migrate -path migrations -database "postgres://loka:loka@localhost:5432/loka?sslmode=disable" up
+	migrate -path migrations -database "$(DB_URL)" up
 	docker compose exec -T postgres psql -U loka -d loka < scripts/seed.sql
+	@echo "Waiting for Kafka..."
+	@for i in $$(seq 1 60); do \
+		docker compose exec -T kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 && exit 0; \
+		sleep 1; \
+	done; \
+	echo "Kafka not ready after 60s" >&2; exit 1
+	docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic booking-events --partitions 3 --replication-factor 1
 
 seed:
 	docker compose exec -T postgres psql -U loka -d loka < scripts/seed.sql

@@ -2,6 +2,7 @@ package booking
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -32,6 +33,10 @@ type fakeStore struct {
 	insErr   error
 	insCalls int
 	inserted *storage.Booking
+
+	outErr      error
+	outCalls    int
+	outInserted *storage.Outbox
 
 	booking    *storage.Booking
 	bookingErr error
@@ -167,6 +172,17 @@ func (f *fakeStore) WithSerializableTx(ctx context.Context, fn func(Store) error
 		return f.serializableErrs[i]
 	}
 	return fn(f)
+}
+
+func (f *fakeStore) InsertOutboxEvent(ctx context.Context, o *storage.Outbox) error {
+	f.outCalls++
+	if f.outErr != nil {
+		return f.outErr
+	}
+	o.ID = 1
+	o.CreatedAt = time.Now()
+	f.outInserted = o
+	return nil
 }
 
 // testUnit returns an inventory unit with sensible defaults, adjustable per test.
@@ -1137,5 +1153,47 @@ func TestServiceCreateSerializableExhaustsRetries(t *testing.T) {
 	}
 	if got := svc.retries.Load(); got != testRetries {
 		t.Errorf("retries: got %d, want %d", got, testRetries)
+	}
+}
+
+func TestServiceCreateWritesBookingCreatedEvent(t *testing.T) {
+	store := &fakeStore{unit: testUnit(10, 10, 1)}
+	svc := NewService(store, testLogger, false, "single")
+
+	got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 2, testVisit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if store.outCalls != 1 {
+		t.Fatalf("InsertOutboxEvent calls: got %d, want 1", store.outCalls)
+	}
+	ev := store.outInserted
+	if ev.AggregateType != bookingAggregate || ev.EventType != eventBookingCreated {
+		t.Errorf("event: got %s/%s, want %s/%s", ev.AggregateType, ev.EventType, bookingAggregate, eventBookingCreated)
+	}
+	if ev.AggregateID != got.BookingID {
+		t.Errorf("aggregate id: got %v, want the booking id %v", ev.AggregateID, got.BookingID)
+	}
+
+	var p bookingCreatedPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if p.Version != bookingCreatedVersion || p.BookingID != got.BookingID || p.Qty != 2 {
+		t.Errorf("payload: got %+v", p)
+	}
+}
+
+func TestServiceCreateFailsWhenEventCannotBeWritten(t *testing.T) {
+	store := &fakeStore{unit: testUnit(10, 10, 1), outErr: errStore}
+	svc := NewService(store, testLogger, false, "single")
+
+	got, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if !errors.Is(err, errStore) {
+		t.Errorf("error: got %v, want %v", err, errStore)
+	}
+	if got != nil {
+		t.Errorf("booking: got %+v, want nil — no event means no booking", got)
 	}
 }

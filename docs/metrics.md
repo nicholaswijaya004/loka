@@ -700,3 +700,62 @@ read 5 new messages, not all 13.
 
 - Check `outbox_events` against the columns the outbox pattern needs,
   especially a key column (`aggregate_id`) for per-booking ordering
+
+## Day 15
+
+**Goal:** Make "a booking and its event" all-or-nothing with a transactional
+outbox, publish events to Kafka with a relay, and prove a relay crash can cause
+duplicates but never a lost event.
+
+**Design:**
+
+- `booking.created` is written to `outbox_events` in the same transaction as the booking, for all four strategies, through one shared helper.
+- A separate program, `cmd/relay`, polls with `SELECT … WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`.
+- It publishes each event to `booking-events` with key = `booking_id` and headers `event_id` and `event_type`, then marks the batch published, all in one transaction.
+- A publish failure is recorded (`attempt_number`, `error`) and the batch stops there, so a later event for the same booking can't overtake it.
+- Batch size 100, poll interval 500 ms, delivery timeout 10 s, `MaxConns = 2`.
+
+**Tests added:**
+
+| Package                             | Proves                                                                                                                                                       | Result                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| booking (unit)                      | a booking writes one correct `booking.created`; a failed event write fails the booking                                                                       | ✓                     |
+| booking (integration)               | all 4 strategies write booking + event together; an injected outbox failure leaves neither                                                                   | 8/8 ✓                 |
+| storage (integration)               | fetch returns unpublished events oldest-first within the limit; mark and record-failure behave; `SKIP LOCKED` hands two relays disjoint rows without waiting | 15/15 ✓ (×3)          |
+| relay (integration, fake publisher) | publish-all; failure recorded and batch stopped; retry next run in order; empty; batch size; `Run` drains a backlog and stops on cancel                      | 18/18 ✓ (×3, `-race`) |
+
+**`SKIP LOCKED`:** relay 1 locked events 1–2, relay 2 got exactly [3 4] in
+21–149 ms against a 2 s deadline. After relay 1 committed without marking, all 4
+were available again.
+
+**Missing topic (accidental test):** after `make reset`, `booking-events` didn't
+exist, and franz-go doesn't auto-create topics. Publishes failed with
+`UNKNOWN_TOPIC_OR_PARTITION` about every 10.5 s (the 10 s delivery timeout plus
+the 500 ms poll). The relay kept running and lost nothing. Once the topic was
+created, the pending event was published without a restart. `make reset` now
+creates the topic explicitly (3 partitions).
+
+**End-to-end latency:** booking to `published_at`, about 0.1–0.2 s, within one poll interval.
+
+**Crash after publishing, before marking:**
+
+| Step                           | Outbox (`published_at`)                       | Kafka      |
+| ------------------------------ | --------------------------------------------- | ---------- |
+| 3 bookings, relay stopped      | 3 pending                                     | 0 messages |
+| relay crashes after publishing | 3 pending (transaction rolled back)           | 3 messages |
+| normal relay runs              | 3 published (same timestamp, one transaction) | 6 messages |
+
+The duplicates carry the same `event_id` (1, 2, 3), key and payload, on the same
+partition, at new offsets. Per-partition order held: partition 0 shows
+event 1, 3, 1, 3. `attempt_number` stayed 0, because a crash isn't a recorded
+publish failure.
+
+**Result:** no event lost, duplicates as designed. Consumers must deduplicate on
+`event_id`.
+
+**Open:**
+
+- Idempotent consumer (Day 16)
+- Dead-letter handling: one permanently failing event blocks everything behind it
+- Server-side re-claim for a released idempotency key (the Block 0 note)
+- Per-booking ordering if more than one relay runs
