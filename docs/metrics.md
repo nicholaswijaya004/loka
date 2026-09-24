@@ -759,3 +759,76 @@ publish failure.
 - Dead-letter handling: one permanently failing event blocks everything behind it
 - Server-side re-claim for a released idempotency key (the Block 0 note)
 - Per-booking ordering if more than one relay runs
+
+## Day 16
+
+**Goal:** Turn at-least-once delivery into effectively-once processing: every
+event takes effect exactly once, even when it is delivered more than once.
+
+**Design:**
+
+- **`processed_events (consumer, event_id)`** is the primary key. Each consumer tracks its own progress, so two services consuming the same event don't block each other.
+- **`ClaimEvent`** is `INSERT … ON CONFLICT DO NOTHING`. 1 row inserted means new, 0 rows means duplicate. There's no `SELECT` first, so no check-then-act race.
+- **`Process`** claims the event and runs the handler **in one transaction**. A handler failure rolls back the claim, so the event is retried.
+- **`Run`** polls, then parses, processes and retries each record. It commits the Kafka offset **only after** the database commit, using `DisableAutoCommit` and `BlockRebalanceOnPoll`.
+- **Failures:**
+  - poison (bad headers, bad payload, unknown version): logged with partition and offset, then skipped;
+  - transient: the same record is retried with backoff from 100 ms to 6.4 s.
+- **`notifications`** has a `UNIQUE (booking_id, kind)` index as a second line of defence, with the insert using `ON CONFLICT DO NOTHING`.
+- **Row retention:** rows must live at least as long as Kafka retention (168 h, 7 days), plus a margin.
+
+**Tests added:**
+
+| Package | Proves | Result |
+|---|---|---|
+| consumer (unit) | `parseEvent`: valid records; missing or invalid `event_id`, `event_type`, or overflow → `ErrPoisonMessage`; the error names partition and offset | ✓ |
+| storage (integration) | `ClaimEvent`: new vs duplicate; per consumer; different events are independent; a rolled-back claim is forgotten; 20 concurrent claims → exactly 1 winner | 18/18 ✓ (×3, `-race`) |
+| consumer (integration) | `Process`: new runs the handler once; a duplicate skips it; a handler failure leaves no claim and is retried; the handler's own write rolls back with the claim | ✓ (×3, `-race`) |
+
+**End-to-end, one booking:** API → outbox → relay → Kafka → notifier → notification.
+
+| Event | Booking → published | Published → processed |
+|---|---|---|
+| 1 | 0.4 s | 15.9 s |
+| 2 | — | 0.03 s |
+
+The steady state is about 30 ms from Kafka to a committed notification. Event 1's
+16 s is **unexplained**. It happened once, with the notifier already running for
+about 3 minutes, and didn't recur in later runs. Investigate with franz-go
+logging if it reappears.
+
+**Experiment 1: duplicates from the relay.** 3 bookings published normally, then 3
+more published twice (a relay crash after publishing, then a normal relay).
+
+| | Count |
+|---|---|
+| Bookings | 8 |
+| Messages in Kafka | 11 (8 + 3 duplicates) |
+| Notifications | 8 |
+| `processed_events` | 8 |
+| `duplicate skipped` logs | 3: event_id 6, 7, 8, exactly the crashed batch |
+
+**Experiment 2: the notifier crashes after the database commit, before the offset commit.**
+
+| | Result |
+|---|---|
+| Notifications after the crash | 10: the database work survived |
+| Notifications after the normal restart | 10: nothing doubled |
+| Consumer group after restart | `LAG 0` on all 3 partitions, log-end total 13 (11 + 2) |
+
+The redelivery of events 9 and 10 (the `duplicate skipped` lines) and its delay
+(expected up to the session timeout, since the crashed member never left the
+group) were **not captured** in the log. The counts and the lag are consistent
+with it, but it isn't directly observed.
+
+**Result:** both sources of duplicates are absorbed. 11 messages → 8 effects in
+experiment 1, and a consumer crash → no double effect in experiment 2.
+
+**Open:**
+
+- Dead-letter topic for poison messages (they're only logged today)
+- An upper limit on retries (a long outage blocks the partition, and rebalances with it)
+- Cleanup job for `processed_events` (≥ 7 days + margin)
+- Unit tests for the notifier handler (unknown type, bad payload, duplicate notification)
+- The 16 s first-message delay
+- Capture the redelivery log in experiment 2
