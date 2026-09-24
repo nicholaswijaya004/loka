@@ -16,6 +16,7 @@ type Consumer struct {
 	store   *storage.Store
 	handler Handler
 	logger  *slog.Logger
+	afterBatch func()
 }
 
 func New(name string, store *storage.Store, handler Handler, logger *slog.Logger) *Consumer {
@@ -46,3 +47,5 @@ func (c *Consumer) Process(ctx context.Context, e Event) (isNew bool, err error)
 	}
 	return isNew, nil
 }
+
+func (c *Consumer) SetAfterBatch(fn func()) { c.afterBatch = fn }

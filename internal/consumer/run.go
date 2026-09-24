@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -41,6 +42,10 @@ func (c *Consumer) Run(ctx context.Context, cl *kgo.Client) error {
 			return nil
 		}
 
+		if c.afterBatch != nil && fetches.NumRecords() > 0 {
+			c.afterBatch()
+		}
+
 		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
 			// The effects are already in the database. If the commit is
 			// lost, the batch is redelivered and deduplicated. Safe.
@@ -67,6 +72,11 @@ func (c *Consumer) handleRecord(ctx context.Context, r *kgo.Record) bool {
 			if !isNew {
 				c.logger.Info("duplicate skipped", "event_id", e.ID, "partition", r.Partition, "offset", r.Offset)
 			}
+			return true
+		}
+
+		if errors.Is(err, ErrPoisonMessage) {
+			c.logger.Error("skipping poison message", "event_id", e.ID, "partition", r.Partition, "offset", r.Offset, "error", err)
 			return true
 		}
 

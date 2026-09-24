@@ -825,3 +825,123 @@ payloads as raw bytes.
 - Dead-letter handling for an event that fails forever
 - Server-side re-claim when a released idempotency key is found
 - Per-booking ordering with more than one relay
+
+## Day 16
+
+### What I built
+
+- **`processed_events`,** a table that records which consumer has finished which event.
+- **`ClaimEvent`,** which inserts that record and tells me whether the event is new or a duplicate.
+- **`internal/consumer`,** the shared machinery: parse a Kafka record, claim it, run the service's handler in the same transaction, retry what might succeed, skip what never will, and commit the offset only after the database.
+- **`internal/notifier` and `cmd/notifier`,** the first real consumer. It writes a `booking_confirmation` row to `notifications` for every `booking.created`.
+
+### Prediction before measuring
+
+Experiment 1 (relay duplicates):
+- messages waiting for the notifier: [fill in]
+- notifications at the end: [fill in]
+- `duplicate skipped` lines: [fill in]
+
+Experiment 2 (crash after the database commit):
+- notifications right after the crash: [fill in]
+- how long the restarted notifier waits before it sees the messages again: [fill in]
+
+### What happened
+
+- **Experiment 1:** 11 messages in Kafka, 8 notifications, and exactly 3 skipped: the 3 events the relay had sent twice.
+- **Experiment 2:** the notifications survived the crash, nothing doubled after the restart, and the group ended at lag 0.
+
+### What I understand now
+
+**Kafka still holds duplicates. The consumer makes them harmless.** The relay
+can't avoid them: Postgres and Kafka can't commit together, so a crash between
+"sent" and "marked" means sending again. The choice is duplicates or losses.
+You take duplicates, and deduplicate at the consumer. Producer at-least-once,
+plus an idempotent consumer, gives effectively-once.
+
+**Duplicates happen without crashes too.** A consumer can crash before
+committing, a rebalance can hit in the middle of a batch, or a publish can time
+out even though Kafka actually stored it. They're rare, but never impossible.
+
+**A committed row in `processed_events` proves the work was committed.** The row
+and the work go in one transaction, so both exist or neither does. Another
+transaction can't see an uncommitted row, so any row it *can* see means "done".
+No status column needed.
+
+**Claim with `INSERT`, not `SELECT`.** Two copies arriving at once would both
+pass a `SELECT` check. With the primary key, the second `INSERT` **waits** for
+the first transaction:
+- if the first **commits**, the second gets a conflict, inserts 0 rows, and skips;
+- if the first **rolls back**, the second inserts and does the work itself, which is correct, because the first one's work never happened.
+
+It's the same as Day 6's idempotency keys: let a database constraint decide
+who's first.
+
+**Put the claim and the work in one transaction.** In separate transactions:
+- claim first, then crash → the effect is lost;
+- work first, then crash → the effect is duplicated.
+
+**Commit the database before the Kafka offset.**
+- Database first, then crash → the message is redelivered, and the claim makes it a skip.
+- Offset first, then crash → the message is never redelivered, and the work is lost.
+
+It's the relay's reasoning again: choose the order where a crash causes a
+duplicate, not a loss.
+
+**The primary key is `(consumer, event_id)`, not just `event_id`.** Otherwise
+the notifier processing event 7 would make a voucher service skip event 7.
+
+**How long to keep rows depends on Kafka retention, not on how fast processing
+is.** A duplicate can only arrive while the message still exists (7 days). A
+stuck partition or a deliberate replay can bring an old message back days
+later. So keep rows for at least 7 days, plus a margin. I first said 45
+minutes, then 24 hours, based on normal processing time, and both would have
+sent duplicate emails.
+
+**Skip what can never succeed; retry what might.** A missing header or a bad
+payload is poison: log it with its location and move past it, or it blocks the
+partition forever. A database outage is transient: retry the same record and
+never move past it.
+
+**A unique-constraint error aborts the whole Postgres transaction.** Catching it
+and returning `nil` doesn't help: the commit becomes a rollback, the claim is
+lost, and the event loops forever. `ON CONFLICT DO NOTHING` avoids the error
+entirely.
+
+**`TRUNCATE … RESTART IDENTITY` means every table that stores copied IDs must be
+reset too.** Otherwise a leftover `('notifier', 1)` makes the next test's new
+event 1 look like a duplicate.
+
+**The handler is the service-specific part, and everything else is shared.**
+It's the `http.Handler` pattern: the framework receives, and my code reacts to
+one item. `Handle` gets `tx`, so its writes can't escape the transaction.
+
+### Things that went wrong
+
+- I started work on `main`, without a branch. Fixed with `git switch -c`, then `git branch -f main origin/main`.
+- A commit "didn't happen". It was the pre-commit hook blocking on `gofmt` and the message scrolled past. The cause every time was **CRLF line endings** from my editor on WSL.
+- I swapped the up and down migrations. `migrate` ran `DROP TABLE` going up.
+- `ClaimEvent`, first version:
+  - it didn't check the `Exec` error, so a database outage would have looked like a duplicate;
+  - it returned a duplicate as an error;
+  - it was lowercase, so the consumer package couldn't call it.
+- I confused the relay's side with the consumer's side: I tried to build a `kgo.Record` in `parseEvent`, and used `storage.Outbox` as the consumer's event type.
+- I mixed up Kafka retention (7 days) with the session timeout (about 45 s).
+
+### Questions I should be able to answer
+
+- Why can't the producer prevent duplicates, and what makes them harmless?
+- Why claim with `INSERT` instead of `SELECT`? What does a second `INSERT` do while the first is uncommitted?
+- Why must the claim and the work share one transaction? Why is the database committed before the offset?
+- Why is the primary key `(consumer, event_id)`?
+- How long must `processed_events` rows be kept, and why?
+- Poison vs transient failures: what does each do to a partition?
+- Why does catching a unique violation inside the transaction cause an endless loop?
+
+### Still open
+
+- A dead-letter topic, and a limit on retries
+- The `processed_events` cleanup job
+- Notifier handler tests
+- The 16 s delay on the first event
+- Editor saving LF on WSL
