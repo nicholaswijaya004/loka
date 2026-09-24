@@ -16,7 +16,7 @@ func (s *Store) ClaimEvent(ctx context.Context, consumer string, eventID int64) 
 		return false, fmt.Errorf("claim event %d for %s: %w", eventID, consumer, err)
 	}
 
-	// return false ans nil, means no error nothing went wrong
+	// return false and nil, means no error nothing went wrong
 	// skip the messages
 	if tag.RowsAffected() == 0 {
 		return false, nil
