@@ -74,7 +74,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
 
 	_, err := pool.Exec(ctx, `
-		TRUNCATE outbox_events, idempotency_keys, payments,
+		TRUNCATE outbox_events, processed_events, idempotency_keys, payments,
 		         bookings, inventory_units, customers
 		RESTART IDENTITY CASCADE`)
 	if err != nil {
