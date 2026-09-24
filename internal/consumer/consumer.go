@@ -12,10 +12,10 @@ import (
 var ErrPoisonMessage = errors.New("poison message")
 
 type Consumer struct {
-	name    string // permanent: it's the key in processed_events
-	store   *storage.Store
-	handler Handler
-	logger  *slog.Logger
+	name       string // permanent: it's the key in processed_events
+	store      *storage.Store
+	handler    Handler
+	logger     *slog.Logger
 	afterBatch func()
 }
 
