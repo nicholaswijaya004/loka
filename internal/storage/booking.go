@@ -79,3 +79,33 @@ func (s *Store) GetBooking(ctx context.Context, id uuid.UUID) (*Booking, error) 
 	}
 	return &b, nil
 }
+
+func (s *Store) TransitionBookingStatus(ctx context.Context, id uuid.UUID, from, to string, failureReason *string) error {
+	tag, err := s.db.Exec(ctx, `
+		UPDATE bookings
+		SET booking_status = $3,
+		    updated_at     = now(),
+		    confirmed_at   = CASE WHEN $3::text = 'confirmed' THEN now() ELSE confirmed_at END,
+		    cancelled_at   = CASE WHEN $3::text = 'cancelled' THEN now() ELSE cancelled_at END,
+		    failure_reason = COALESCE($4::text, failure_reason)
+		WHERE booking_id = $1 AND booking_status = $2
+	`, id, from, to, failureReason)
+	if err != nil {
+		return fmt.Errorf("transition booking %s %s→%s: %w", id, from, to, err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	// Zero rows: either the booking is in another status, or it doesn't exist.
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM bookings WHERE booking_id = $1)`, id,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("transition booking %s: check existence: %w", id, err)
+	}
+	if !exists {
+		return ErrBookingNotFound
+	}
+	return fmt.Errorf("%w: booking %s is not %s", ErrStatusConflict, id, from)
+}

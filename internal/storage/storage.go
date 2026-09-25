@@ -16,6 +16,7 @@ var ErrBookingNotFound = errors.New("booking not found")
 var ErrIdempotencyKeyNotFound = errors.New("idempotency key not found")
 var ErrVersionConflict = errors.New("version conflict")
 var ErrSerializationFailure = errors.New("serialization failure")
+var ErrStatusConflict = errors.New("booking status changed")
 
 type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row

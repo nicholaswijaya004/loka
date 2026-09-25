@@ -3,5 +3,6 @@
     "editor.defaultFormatter": "golang.go",
     "editor.formatOnSave": true,
     "editor.insertSpaces": false
-  }
+  },
+  "makefile.configureOnOpen": true
 }
