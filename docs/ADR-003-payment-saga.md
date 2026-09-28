@@ -1,6 +1,6 @@
 # ADR-003: Payment saga
 
-**Status:** Proposed. Implementation starts Day 18.
+**Status:** Accepted. Implementation starts Day 18.
 **Date:** 2026-09-25
 **Builds on:**
 

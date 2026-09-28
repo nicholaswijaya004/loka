@@ -17,6 +17,8 @@ var ErrIdempotencyKeyNotFound = errors.New("idempotency key not found")
 var ErrVersionConflict = errors.New("version conflict")
 var ErrSerializationFailure = errors.New("serialization failure")
 var ErrStatusConflict = errors.New("booking status changed")
+var ErrDuplicateSuccessfulPayment = errors.New("booking already has a successful payment")
+var ErrOverRelease = errors.New("release would exceed the unit's total capacity")
 
 type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row

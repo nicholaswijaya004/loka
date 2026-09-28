@@ -838,11 +838,13 @@ payloads as raw bytes.
 ### Prediction before measuring
 
 Experiment 1 (relay duplicates):
+
 - messages waiting for the notifier: [fill in]
 - notifications at the end: [fill in]
 - `duplicate skipped` lines: [fill in]
 
 Experiment 2 (crash after the database commit):
+
 - notifications right after the crash: [fill in]
 - how long the restarted notifier waits before it sees the messages again: [fill in]
 
@@ -865,12 +867,13 @@ out even though Kafka actually stored it. They're rare, but never impossible.
 
 **A committed row in `processed_events` proves the work was committed.** The row
 and the work go in one transaction, so both exist or neither does. Another
-transaction can't see an uncommitted row, so any row it *can* see means "done".
+transaction can't see an uncommitted row, so any row it _can_ see means "done".
 No status column needed.
 
 **Claim with `INSERT`, not `SELECT`.** Two copies arriving at once would both
 pass a `SELECT` check. With the primary key, the second `INSERT` **waits** for
 the first transaction:
+
 - if the first **commits**, the second gets a conflict, inserts 0 rows, and skips;
 - if the first **rolls back**, the second inserts and does the work itself, which is correct, because the first one's work never happened.
 
@@ -878,10 +881,12 @@ It's the same as Day 6's idempotency keys: let a database constraint decide
 who's first.
 
 **Put the claim and the work in one transaction.** In separate transactions:
+
 - claim first, then crash → the effect is lost;
 - work first, then crash → the effect is duplicated.
 
 **Commit the database before the Kafka offset.**
+
 - Database first, then crash → the message is redelivered, and the claim makes it a skip.
 - Offset first, then crash → the message is never redelivered, and the work is lost.
 
@@ -945,3 +950,164 @@ one item. `Handle` gets `tx`, so its writes can't escape the transaction.
 - Notifier handler tests
 - The 16 s delay on the first event
 - Editor saving LF on WSL
+
+## Day 17
+
+### What I built
+
+- **`cmd/paymock`,** a fake payment provider. It's idempotent on `Idempotency-Key`, and has knobs to make it slow, decline, or succeed without answering in time.
+- **`payment_pending`,** the allowed-transitions table, and `TransitionBookingStatus`.
+- **ADR-003,** the payment saga design.
+
+### What I understand now
+
+**The hardest case in payments is a timeout that was actually a success.** The
+money moved, but the answer never arrived. Retrying with the **same**
+idempotency key is safe: the provider replays what already happened. The key is
+chosen by the caller (here, the booking ID), not the provider.
+
+**Idempotency records must survive restarts.** The paymock keeps keys in memory,
+so after a restart it charged `test-1` again. A real provider stores keys
+durably, for the same reason my `idempotency_keys` table is in Postgres.
+
+**A decline is an answer; a timeout is not.** A decline returns `200` with
+`status: declined`: the request was valid, and the answer is "no". Only a
+malformed request is a `400`.
+
+**Why `payment_pending` exists.** With only `pending`, an expiry job could cancel
+a booking while its charge was succeeding. The customer pays, and the booking is
+gone. Expiry only touches `pending`, so a booking with a charge in flight is safe.
+
+**A transaction doesn't stop two processes contradicting each other.** Both can
+read `payment_pending`, decide, and write. What stops it is putting the expected
+status **in the `UPDATE`** (compare-and-set). Also: always check the `WHERE` of
+an `UPDATE`. Without `booking_id`, it would change every booking in that state.
+
+**Never cancel when you don't know if money moved.** Keep retrying with the same
+key; after a threshold, escalate to a human, and leave the booking
+`payment_pending`, which is the truthful state.
+
+**Compensation is not rollback.** The seat decrement committed long ago. Giving
+seats back is a new write that reverses its effect.
+
+### Things that went wrong
+
+- `curl -max-time` instead of `--max-time`: one dash is for single letters.
+- A migration's `\d` showed the constraint as `= ANY (ARRAY[…])`, which is the same as `IN (…)`.
+- Docker's daemon stopped several times after sleep or reboot.
+- Lint flagged `checkTransition` as unused, because I hadn't written its test yet.
+
+## Day 18
+
+### What I built
+
+The saga from ADR-003:
+
+- a consumer that starts it;
+- a worker that charges and confirms or compensates;
+- the storage pieces they need (claim with a lease, record a payment, release seats);
+- an HTTP client that turns responses into outcomes;
+- `cmd/payments`, running both.
+
+### Prediction before measuring
+
+For the lost-response test:
+
+1. The worker would log a retry after about 10 s: ✅
+2. The booking would be `confirmed` right after that: ❌ It stayed `payment_pending`. After a timeout the worker knows nothing, so it records nothing.
+3. It would be confirmed after about 2 s: ❌ It took 30.2 s: the lease has to run out before anyone tries again.
+4. Two charge lines, the same `charge_id`, differing in `lost_response` and `replay`: ✅
+5. One payment row: ✅
+
+### What happened
+
+- **Success:** confirmed about 0.9 s after `booking.created` reached Kafka.
+- **Decline:** cancelled, with the seats going 9 → 8 → 9, released exactly once. `cancelled_at` and `failed_at` were identical to the microsecond, which proves one transaction.
+- **Lost response:** the worker asked twice, the provider charged once, and the booking was confirmed after the lease.
+
+### What I understand now
+
+**The consumer name is who reads, not what is read.** Payments and the notifier
+read the same topic, but each needs its own group (so each gets every event) and
+its own `processed_events` key (so one doesn't skip the other's events).
+
+**Small interfaces avoid adapters.** `storeAdapter` exists only because of
+`WithTx`'s signature. `Transition` needs just one method, so it takes a
+one-method interface, and `*storage.Store` fits directly.
+
+**What `Handle` returns decides what `Run` does:**
+
+- `nil` → done;
+- poison → skip;
+- anything else → retry forever.
+
+So a conflict (the booking isn't pending any more) is `nil`, because retrying
+can't make it pending again. A missing booking or an illegal transition is
+poison.
+
+**The row lock makes the second worker wait; the status condition makes it
+fail.** Under `READ COMMITTED`, the waiting `UPDATE` re-checks its `WHERE` after
+the first commits, and matches 0 rows.
+
+**A lease instead of a lock.** A lock can't be held during an HTTP call without
+holding a transaction open. Pushing `next_attempt_at` forward claims the booking
+without a transaction. If the worker dies, the lease simply runs out. A
+permanent "done" marker would strand the booking forever after a crash.
+
+**Measure waiting from `updated_at`, not `created_at`.** Escalation is about time
+in `payment_pending`. Claiming must not touch `updated_at`, or repeated claims
+would hide a stuck payment.
+
+**Classify HTTP answers by what they tell you about the money:**
+
+| Answer                                           | Classification                                                                              |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `200` succeeded / declined                       | a result                                                                                    |
+| timeout, connection refused, `5xx`, `408`, `429` | unknown → retry with the same key. A `5xx` may come after charging, so it's never a decline |
+| other `4xx`, or a `200` with an unknown status   | permanent → escalate, never cancel                                                          |
+
+**A sentinel error marks a _kind_ of failure.** The caller checks with
+`errors.Is`, through any wrapping, instead of matching message text.
+
+**A decline must record everything in one transaction:** the transition,
+releasing seats, the payment row, and the event. The transition comes first, so
+a second worker fails fast with `ErrStatusConflict`. A lost race is not an error;
+it means the work is already done.
+
+**The unique index is the backstop, not the protection.** It only covers
+successful payments. The compare-and-set protects everything in the transaction.
+`chk_availability` can't catch a double release that stays under capacity.
+
+**A batch must finish inside its lease.** Charging sequentially would outlive the
+lease for later bookings, so the batch runs in parallel.
+
+### Things that went wrong
+
+- I named the payments handler `Notifier`, and kept the notifier's payload, method names and comments.
+- I used `booking.StatusConfirmed` instead of `StatusPaymentPending` in the consumer. That would have poisoned every booking.
+- I passed the type `*storage.Store` instead of the variable `tx`.
+- I thought a timeout couldn't be fixed by retrying. It's exactly what the same key fixes.
+- I thought a `500` meant "not charged". It can come after charging.
+- I proposed cancelling after repeated failures, which could void a paid booking. The rule is to escalate.
+- I thought transaction order affects atomicity. It doesn't: the order only decides how fast and how clearly a conflict fails.
+- `errcheck` flagged `resp.Body.Close()`. Ignoring it with `_ =` is fine when I can say why the error doesn't matter.
+- I ran the result queries for the previous booking's ID.
+
+### Questions I should be able to answer
+
+- Why does each consumer need its own group name?
+- Why does a small interface let `*storage.Store` be passed without an adapter?
+- What stops two workers confirming the same booking?
+- Why a lease rather than a lock, and why not a "processed" flag?
+- How is each HTTP response classified, and why is a `5xx` never a decline?
+- Why is a lost race logged, not treated as an error?
+- Why must a batch finish within its lease?
+- Walk through the lost-response scenario: why exactly one charge?
+
+### Still open
+
+- Worker integration tests with a fake provider
+- A provider lookup endpoint for recovery
+- The expiry job
+- An escalation alert
+- The provider-down and worker-crash experiments
