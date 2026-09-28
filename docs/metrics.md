@@ -779,18 +779,18 @@ event takes effect exactly once, even when it is delivered more than once.
 
 **Tests added:**
 
-| Package | Proves | Result |
-|---|---|---|
-| consumer (unit) | `parseEvent`: valid records; missing or invalid `event_id`, `event_type`, or overflow → `ErrPoisonMessage`; the error names partition and offset | ✓ |
-| storage (integration) | `ClaimEvent`: new vs duplicate; per consumer; different events are independent; a rolled-back claim is forgotten; 20 concurrent claims → exactly 1 winner | 18/18 ✓ (×3, `-race`) |
-| consumer (integration) | `Process`: new runs the handler once; a duplicate skips it; a handler failure leaves no claim and is retried; the handler's own write rolls back with the claim | ✓ (×3, `-race`) |
+| Package                | Proves                                                                                                                                                          | Result                |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| consumer (unit)        | `parseEvent`: valid records; missing or invalid `event_id`, `event_type`, or overflow → `ErrPoisonMessage`; the error names partition and offset                | ✓                     |
+| storage (integration)  | `ClaimEvent`: new vs duplicate; per consumer; different events are independent; a rolled-back claim is forgotten; 20 concurrent claims → exactly 1 winner       | 18/18 ✓ (×3, `-race`) |
+| consumer (integration) | `Process`: new runs the handler once; a duplicate skips it; a handler failure leaves no claim and is retried; the handler's own write rolls back with the claim | ✓ (×3, `-race`)       |
 
 **End-to-end, one booking:** API → outbox → relay → Kafka → notifier → notification.
 
 | Event | Booking → published | Published → processed |
-|---|---|---|
-| 1 | 0.4 s | 15.9 s |
-| 2 | — | 0.03 s |
+| ----- | ------------------- | --------------------- |
+| 1     | 0.4 s               | 15.9 s                |
+| 2     | —                   | 0.03 s                |
 
 The steady state is about 30 ms from Kafka to a committed notification. Event 1's
 16 s is **unexplained**. It happened once, with the notifier already running for
@@ -800,21 +800,21 @@ logging if it reappears.
 **Experiment 1: duplicates from the relay.** 3 bookings published normally, then 3
 more published twice (a relay crash after publishing, then a normal relay).
 
-| | Count |
-|---|---|
-| Bookings | 8 |
-| Messages in Kafka | 11 (8 + 3 duplicates) |
-| Notifications | 8 |
-| `processed_events` | 8 |
+|                          | Count                                          |
+| ------------------------ | ---------------------------------------------- |
+| Bookings                 | 8                                              |
+| Messages in Kafka        | 11 (8 + 3 duplicates)                          |
+| Notifications            | 8                                              |
+| `processed_events`       | 8                                              |
 | `duplicate skipped` logs | 3: event_id 6, 7, 8, exactly the crashed batch |
 
 **Experiment 2: the notifier crashes after the database commit, before the offset commit.**
 
-| | Result |
-|---|---|
-| Notifications after the crash | 10: the database work survived |
-| Notifications after the normal restart | 10: nothing doubled |
-| Consumer group after restart | `LAG 0` on all 3 partitions, log-end total 13 (11 + 2) |
+|                                        | Result                                                 |
+| -------------------------------------- | ------------------------------------------------------ |
+| Notifications after the crash          | 10: the database work survived                         |
+| Notifications after the normal restart | 10: nothing doubled                                    |
+| Consumer group after restart           | `LAG 0` on all 3 partitions, log-end total 13 (11 + 2) |
 
 The redelivery of events 9 and 10 (the `duplicate skipped` lines) and its delay
 (expected up to the session timeout, since the crashed member never left the
@@ -832,3 +832,85 @@ experiment 1, and a consumer crash → no double effect in experiment 2.
 - Unit tests for the notifier handler (unknown type, bad payload, duplicate notification)
 - The 16 s first-message delay
 - Capture the redelivery log in experiment 2
+
+## Day 17
+
+**Goal:** A payment provider to fail against, the booking state machine that a
+saga needs, and the saga's design (ADR-003).
+
+**`cmd/paymock`:** `POST /charges` is idempotent on the `Idempotency-Key` header.
+Knobs: `LATENCY_MS`, `DECLINE_RATE`, `LOST_RESPONSE_RATE`, `LOST_RESPONSE_DELAY_MS`.
+
+| Test                                                  | Result                                                                                             |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| same key twice                                        | same `charge_id` (`dff5c360…`), second response has `Idempotent-Replay: true`                      |
+| same key after a paymock restart                      | **new** charge (`055a52eb…`): keys live in memory only. A real provider persists them              |
+| lost response (`--max-time 2`, delay 5 s), then retry | first call timed out after 2005 ms with 0 bytes; the retry replayed the stored success immediately |
+| a lost response without a client timeout              | answered after 5 s: a response is only "lost" if the caller gives up                               |
+
+**Migration 9:** `chk_booking_status` gains `payment_pending`. Up → 4 statuses,
+down → 3, up → 4. The down migration deliberately fails while any booking is
+`payment_pending`.
+
+**State machine:** `pending → payment_pending → confirmed / cancelled`, plus
+`pending → cancelled` (expiry). Enforced by `checkTransition` (table-driven unit
+test, 9 cases) and applied by `TransitionBookingStatus`, a compare-and-set
+(`WHERE booking_id = $1 AND booking_status = $from`).
+
+**ADR-003 (proposed):** the saga as consumer + worker, with the charge outside
+any transaction and compensation tied to the transition.
+
+## Day 18
+
+**Goal:** Build ADR-003 and prove its failure table.
+
+**Built:**
+
+- **The payments consumer (`internal/payments`, group `payments`):** `booking.created` → `pending → payment_pending`.
+- **`booking.Transition`:** checks the move is legal, then compare-and-set. It takes a one-method `transitioner` interface, so a plain `*storage.Store` works without an adapter.
+- **Storage:**
+  - `ClaimDuePayments`: `FOR UPDATE SKIP LOCKED` plus a lease on `next_attempt_at` (migration 10, with a partial index on `payment_pending`);
+  - `InsertPayment`;
+  - `ReleaseSeats`.
+- **`Provider` interface and `HTTPProvider`:** HTTP → succeeded / declined / permanent error / transient error.
+- **The worker:** claims a batch, charges it **in parallel**, and applies each outcome in one transaction.
+- **`cmd/payments`:** runs the consumer and the worker together.
+
+**Design change during implementation:** a batch claimed with a 30 s lease and
+charged sequentially (10 s timeout each) would outlive its leases from the
+fourth booking on. So charges within a batch now run in parallel, and a batch
+finishes in about one timeout.
+
+**Settings:** batch 10, poll 500 ms, lease 30 s, charge timeout 10 s, escalation
+after 30 min, `MaxConns` = batch + 4.
+
+**Tests added:**
+
+| Package                     | Proves                                                                                                                                                                       | Result          |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| booking (unit)              | `Transition`: an illegal move never reaches the store; a race passes through as `ErrStatusConflict`; a legal move reaches the store unchanged                                | ✓               |
+| payments (integration)      | consumer: pending → payment_pending; not pending → `nil`, unchanged; unknown booking or bad payload → poison; other event types ignored                                      | ✓ (×3, `-race`) |
+| storage (integration)       | `ClaimDuePayments`: only `payment_pending`; lease hides a booking; expired lease makes it due; `updated_at` untouched; oldest first within limit; concurrent claims disjoint | ✓ (×3, `-race`) |
+| storage (integration)       | `InsertPayment`: succeeded and failed rows; second success → `ErrDuplicateSuccessfulPayment`; several failures allowed                                                       | ✓               |
+| storage (integration)       | `ReleaseSeats`: gives seats back and bumps version; over-release → `ErrOverRelease`, row unchanged; unknown unit; non-positive qty                                           | ✓               |
+| payments (unit, `httptest`) | 11 status/body cases; rejection body in the error; request matches the contract; timeout, connection refused and cancelled context are transient                             | ✓               |
+
+**End-to-end scenarios:**
+
+| Scenario                                           | Evidence                                                                                                       | Result                                                                                                                                                             |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| success                                            | `booking.created` published 15:41:02.259 → confirmed 15:41:03.143 → `booking.confirmed` published 15:41:03.389 | about 0.9 s from event to confirmed; one `succeeded` payment with the paymock's `charge_id`                                                                        |
+| decline (`DECLINE_RATE=1`)                         | seats 9 → 8 (booking) → 9 (release)                                                                            | `cancelled`, reason `insufficient_funds`; one `failed` payment; `booking.cancelled` published; `cancelled_at` = `failed_at` to the microsecond, so one transaction |
+| lost response (`LOST_RESPONSE_RATE=1`, delay 20 s) | paymock: charge `88f2fd77…` at 22:47:21.517 (`lost_response`), the same `88f2fd77…` at 22:47:51.687 (`replay`) | worker timed out at 10.2 s and left the booking `payment_pending`; confirmed 30.2 s after the first attempt (the lease); **one charge, one payment row**           |
+
+**Not yet run:** the provider down for a while (expect delay, never
+cancellation), and the worker crashing mid-charge (expect recovery after the
+lease). Both rely on the same lease + replay mechanism shown above.
+
+**Open:**
+
+- Worker integration tests with a fake `Provider`
+- The provider lookup endpoint for recovery (`GET /charges/{key}`)
+- The expiry job (`pending → cancelled` plus release)
+- An escalation metric and alert; repeated escalation logs every lease period
+- A dead-letter topic; refunds; card retries with a per-attempt key
