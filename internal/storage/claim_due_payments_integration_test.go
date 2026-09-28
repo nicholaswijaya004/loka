@@ -62,6 +62,7 @@ func TestClaimDuePaymentsOnlyPaymentPending(t *testing.T) {
 		t.Fatalf("claimed: got %v, want only %s", claimedIDs(due), want)
 	}
 
+	d := due[0]
 	if d.UnitID != tenSeatUnitID || d.CustomerID != seedCustomerID ||
 		d.Qty != 2 || d.TotalMinor != 300_000_000 || d.Currency != "IDR" {
 		t.Errorf("fields: got %+v", d)
