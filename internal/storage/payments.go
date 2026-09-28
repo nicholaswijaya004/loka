@@ -19,6 +19,7 @@ const (
 type DuePayment struct {
 	BookingID    uuid.UUID
 	UnitID       uuid.UUID
+	CustomerID   uuid.UUID
 	Qty          int
 	TotalMinor   int64
 	Currency     string
@@ -55,7 +56,7 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 		SET next_attempt_at = now() + ($2 * interval '1 second')
 		FROM due
 		WHERE b.booking_id = due.booking_id
-		RETURNING b.booking_id, b.unit_id, b.qty, b.total_minor, b.currency, b.updated_at
+		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.total_minor, b.currency, b.updated_at
 	`, limit, int(lease.Seconds()))
 	if err != nil {
 		return nil, fmt.Errorf("claim due payments: %w", err)
@@ -65,7 +66,7 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 	var due []DuePayment
 	for rows.Next() {
 		var d DuePayment
-		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince); err != nil {
+		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.CustomerID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince); err != nil {
 			return nil, fmt.Errorf("scan due payment: %w", err)
 		}
 		due = append(due, d)
