@@ -1,9 +1,15 @@
 package booking
 
 import (
-	"errors"
+	"context"
 	"fmt"
+
+	"github.com/google/uuid"
 )
+
+type Transitioner interface {
+	TransitionBookingStatus(ctx context.Context, id uuid.UUID, from, to string, failureReason *string) error
+}
 
 const (
 	StatusPending        = "pending"
@@ -11,10 +17,6 @@ const (
 	StatusConfirmed      = "confirmed"
 	StatusCancelled      = "cancelled"
 )
-
-// ErrIllegalTransition means the requested move isn't part of the booking
-// state machine. It is always a bug in the caller, never a race.
-var ErrIllegalTransition = errors.New("illegal booking status transition")
 
 // allowedTransitions is the booking state machine. Anything not listed is
 // rejected before it reaches the database.
@@ -30,4 +32,11 @@ func checkTransition(from, to string) error {
 		}
 	}
 	return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, from, to)
+}
+
+func Transition(ctx context.Context, tr Transitioner, id uuid.UUID, from, to string, reason *string) error {
+	if err := checkTransition(from, to); err != nil {
+		return err
+	}
+	return tr.TransitionBookingStatus(ctx, id, from, to, reason)
 }
