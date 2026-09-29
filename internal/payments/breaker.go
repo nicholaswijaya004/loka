@@ -42,7 +42,7 @@ func NewBreakerProvider(next Provider, cfg BreakerConfig, logger *slog.Logger) *
 		},
 		IsSuccessful: providerLooksHealthy,
 		OnStateChange: func(name string, from, to gobreaker.State) {
-			logger.Warn("circuit breaker state changed", "breaker", name, "from", from, "to", to)
+			logger.Warn("circuit breaker state changed", "breaker", name, "from", from.String(), "to", to.String())
 		},
 	})
 	return &BreakerProvider{next: next, cb: cb}
