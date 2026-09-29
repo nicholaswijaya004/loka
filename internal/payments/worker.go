@@ -40,14 +40,19 @@ type bookingCancelledPayload struct {
 	CancelledAt time.Time `json:"cancelled_at"`
 }
 
-// WorkerConfig holds the worker's numbers. Timeout (in the Provider) must be
+// WorkerConfig holds the worker's numbers. The provider's timeout must be
 // shorter than Lease, and a batch is charged in parallel so that it finishes
-// within one timeout, well inside its lease.
+// within one timeout, well inside its lease. After a failed attempt, the next
+// try is Lease plus a jittered backoff that grows from BackoffBase up to
+// MaxBackoff; Lease + MaxBackoff must stay well below EscalateAfter, or
+// escalation is delayed.
 type WorkerConfig struct {
 	BatchSize     int
 	Interval      time.Duration
 	Lease         time.Duration
 	EscalateAfter time.Duration
+	BackoffBase   time.Duration
+	MaxBackoff    time.Duration
 }
 
 // Worker charges payment_pending bookings and records each outcome. It is
@@ -68,7 +73,7 @@ func NewWorker(store *storage.Store, provider Provider, logger *slog.Logger, cfg
 // problems are handled and logged here; the only error returned is failing
 // to claim at all.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
-	due, err := w.store.ClaimDuePayments(ctx, w.cfg.BatchSize, w.cfg.Lease)
+	due, err := w.store.ClaimDuePayments(ctx, w.cfg.BatchSize, w.cfg.Lease, w.cfg.BackoffBase, w.cfg.MaxBackoff)
 	if err != nil {
 		return 0, fmt.Errorf("claim due payments: %w", err)
 	}
@@ -106,11 +111,14 @@ func (w *Worker) processOne(ctx context.Context, d storage.DuePayment) {
 		switch {
 		case IsPermanent(err):
 			// Retrying can't help. Escalate now; never cancel.
-			log.Error("payment needs review: escalate", "waiting", waiting, "error", err)
+			log.Error("payment needs review: escalate",
+				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		case waiting > w.cfg.EscalateAfter:
-			log.Error("payment stuck: escalate", "waiting", waiting, "error", err)
+			log.Error("payment stuck: escalate",
+				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		default:
-			log.Warn("charge got no answer, will retry", "waiting", waiting, "error", err)
+			log.Warn("charge got no answer, will retry",
+				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		}
 		return
 	}

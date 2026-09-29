@@ -37,6 +37,8 @@ var workerCfg = payments.WorkerConfig{
 	Interval:      500 * time.Millisecond,
 	Lease:         30 * time.Second,
 	EscalateAfter: 30 * time.Minute,
+	BackoffBase:   5 * time.Second,
+	MaxBackoff:    5 * time.Minute,
 }
 
 func main() {
@@ -95,7 +97,9 @@ func run() error {
 
 	logger.Info("payments started",
 		"topic", topic, "group", payments.ConsumerName, "provider", providerURL,
-		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout)
+		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout,
+		"backoff_base", workerCfg.BackoffBase, "max_backoff", workerCfg.MaxBackoff,
+		"escalate_after", workerCfg.EscalateAfter)
 
 	// Run both. If either stops, cancel the other, then wait for it too.
 	errs := make(chan error, 2)
