@@ -24,6 +24,7 @@ type DuePayment struct {
 	TotalMinor   int64
 	Currency     string
 	PendingSince time.Time // updated_at: when it entered payment_pending; drives escalation
+	Attempts     int
 }
 
 // Payment is one payment outcome to record. Timeouts are not recorded: an
@@ -38,10 +39,11 @@ type Payment struct {
 }
 
 // ClaimDuePayments claims up to limit payment_pending bookings whose next
-// attempt is due, and pushes their next_attempt_at forward by lease, so no
+// attempt is due, and pushes their next_attempt_at forward by its lease plus a jittered,
+// exponential backoff, capped at maxBackoff, and it also counts the attempt, so no
 // other worker picks them up while this one is charging. If the worker dies,
 // the lease simply runs out and the booking becomes due again.
-func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Duration) ([]DuePayment, error) {
+func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Duration, backoffBase time.Duration, maxBackoff time.Duration) ([]DuePayment, error) {
 	rows, err := s.db.Query(ctx, `
 		WITH due AS (
 			SELECT booking_id
@@ -53,12 +55,21 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE bookings b
-		SET next_attempt_at = now() + ($2 * interval '1 second')
+		SET payment_attempts = b.payment_attempts + 1,
+			next_attempt_at  = now() + (
+				$2
+				+ random() * least($4::float8, $3::float8 * 2 ^ b.payment_attempts)
+			) * interval '1 second'
 		FROM due
 		WHERE b.booking_id = due.booking_id
-		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.total_minor, b.currency, b.updated_at
-	`, limit, int(lease.Seconds()))
+		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.total_minor, b.currency, b.updated_at, b.payment_attempts
+	`, limit, int(lease.Seconds()), int(backoffBase.Seconds()), int(maxBackoff.Seconds()))
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			return nil, fmt.Errorf("claim due payments: %w (position %d, detail %q)",
+				err, pgErr.Position, pgErr.Detail)
+		}
 		return nil, fmt.Errorf("claim due payments: %w", err)
 	}
 	defer rows.Close()
@@ -66,7 +77,7 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 	var due []DuePayment
 	for rows.Next() {
 		var d DuePayment
-		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.CustomerID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince); err != nil {
+		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.CustomerID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince, &d.Attempts); err != nil {
 			return nil, fmt.Errorf("scan due payment: %w", err)
 		}
 		due = append(due, d)

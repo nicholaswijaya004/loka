@@ -914,3 +914,100 @@ lease). Both rely on the same lease + replay mechanism shown above.
 - The expiry job (`pending → cancelled` plus release)
 - An escalation metric and alert; repeated escalation logs every lease period
 - A dead-letter topic; refunds; card retries with a per-attempt key
+
+## Day 19
+
+**Goal:** Make payment retries resilient: exponential backoff with full jitter,
+and a circuit breaker around the payment provider (the original plan's Day 26).
+Prove both during a provider outage.
+
+**Settings:**
+
+| Setting                   | Value                  | Constraint                        |
+| ------------------------- | ---------------------- | --------------------------------- |
+| charge timeout            | 10 s                   | < lease                           |
+| lease                     | 30 s                   | always included in full           |
+| backoff base / max        | 5 s / 5 min            | lease + max ≪ escalation (30 min) |
+| breaker: trip after       | 5 consecutive failures |                                   |
+| breaker: open for         | 30 s                   | > charge timeout                  |
+| breaker: half-open probes | 1                      |                                   |
+
+**Backoff:**
+
+- Migration 11 adds `bookings.payment_attempts`.
+- Each claim increments it, and sets `next_attempt_at` to
+  `now + lease + random() × min(max, base × 2^attempts)`: full jitter,
+  **added to** the lease.
+- The first design took the **larger** of the lease and the backoff. That gave
+  identical retry times for early attempts (no jitter at all, exactly when a
+  herd forms), so it was replaced before implementation.
+
+**Circuit breaker:**
+
+- `BreakerProvider` decorates `HTTPProvider` (`sony/gobreaker/v2`). One
+  instance is shared by the whole worker.
+- Counts only transient provider failures: timeouts, refused connections,
+  `5xx`, `408`, `429`.
+- Declines, `ErrChargeRejected`, `ErrUnexpectedProviderResponse` and
+  `context.Canceled` never count.
+- A refused call is transient, so the booking waits for its next attempt.
+
+**Tests added:**
+
+| Package               | Proves                                                                                                                                                                                                                                                                                                                          | Result          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| storage (integration) | claims count attempts (1, 2); delay stays within lease … lease+base (first attempt) and lease … lease+max (10 attempts, capped); across 20 bookings at attempt 10, delays exceed anything a first attempt could get                                                                                                             | ✓ (×3, `-race`) |
+| payments (unit)       | breaker opens after 5 consecutive failures and stops calling the provider; declines, rejections, unrecognised responses and cancellations never open it; a success resets the count; recovers after the timeout; a failed probe reopens it; half-open allows exactly one probe, and others get a transient `ErrTooManyRequests` | ✓ (×3, `-race`) |
+
+**Outage experiment:** paymock stopped, 6 bookings made at 18:38:43–45, paymock
+restarted about 5½ minutes later.
+
+| Time                                                     | Event                                                                                                          |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| 18:38:45.010 – 18:38:46.123                              | 6 charges reach the dead provider (`connection refused`)                                                       |
+| 18:38:46.121                                             | breaker **closed → open** after the 5th failure. The 6th had already started, since the batch runs in parallel |
+| 18:39:17, :39:50, :40:22, :41:01, :41:35, :42:35, :43:25 | **open → half-open → open**: one probe each, all failed                                                        |
+| between probes                                           | every other call: `circuit breaker refused the call`, with no network call                                     |
+| 18:44:25.843                                             | probe **succeeds** → breaker **closed**                                                                        |
+| 18:44:25.857 – 18:45:13.180                              | all 6 confirmed, each when its own `next_attempt_at` came due (spread over 48 s)                               |
+
+**Retries spreading out (jitter + exponential backoff):**
+
+| Attempt | Retries landed between | Spread                |
+| ------- | ---------------------- | --------------------- |
+| 2       | 18:39:15 – 18:39:20    | about 5 s             |
+| 3       | 18:39:50 – 18:39:58    | about 8 s             |
+| 4       | 18:40:22 – 18:40:38    | about 16 s            |
+| 5–6     | 18:41:01 – 18:42:58    | wider; rounds overlap |
+
+A psql snapshot at attempt 2 showed `next_attempt_at` 11–19 s ahead: 6
+bookings that failed together, retrying at different times.
+
+**Calls to the provider during the outage:** 37 failed attempts in total, of
+which only **13 reached the provider** (the first burst of 6, plus 7 probes).
+Without the breaker, all 37 would have.
+
+**Result:**
+
+- 6 bookings `confirmed`, 1 succeeded payment each, 6 distinct `charge_id`s.
+- No booking cancelled, none escalated (the outage stayed well under 30 min).
+- No call made during the outage reached the provider, so each booking was
+  charged exactly once.
+
+**Observations:**
+
+- **A breaker can't stop calls already in flight.** In a parallel burst, "trip
+  after 5" still let 6 through.
+- **Attempts rise while the breaker is open,** although no real call is made,
+  because the claim counts the attempt before `Charge` is refused. It's
+  harmless (it only lengthens the backoff), but it isn't a true count of calls.
+- **Recovery is paced by each booking's schedule,** not by the breaker
+  closing: 48 s from the breaker closing to the last confirmation.
+
+**Open:**
+
+- Validate the config at startup (`MaxBackoff > 0`, `Lease + MaxBackoff < EscalateAfter`, `OpenTimeout > charge timeout`)
+- Skip claiming while the breaker is open, so attempts aren't burnt
+- Consider a failure-ratio trip, for providers that fail only intermittently
+- Breaker state as a metric, and an alert on "open"
+- Remove or generalise the `pgErr.Position` debug branch in `ClaimDuePayments`

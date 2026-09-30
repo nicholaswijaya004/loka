@@ -37,6 +37,17 @@ var workerCfg = payments.WorkerConfig{
 	Interval:      500 * time.Millisecond,
 	Lease:         30 * time.Second,
 	EscalateAfter: 30 * time.Minute,
+	BackoffBase:   5 * time.Second,
+	MaxBackoff:    5 * time.Minute,
+}
+
+// The breaker opens after 5 consecutive provider failures, stays open for
+// 30s (longer than one charge timeout, so a probe never overlaps a call still
+// in flight), then lets a single probe through.
+var breakerCfg = payments.BreakerConfig{
+	TripAfter:   5,
+	OpenTimeout: 30 * time.Second,
+	MaxRequests: 1,
 }
 
 func main() {
@@ -91,11 +102,21 @@ func run() error {
 
 	store := storage.NewStore(pool)
 	sagaStarter := consumer.New(payments.ConsumerName, store, payments.New(logger), logger)
-	worker := payments.NewWorker(store, payments.NewHTTPProvider(providerURL, chargeTimeout), logger, workerCfg)
+
+	// Decorator stack: the breaker wraps the HTTP client. One breaker, shared
+	// by every charge the worker makes, so it sees all the calls.
+	provider := payments.NewBreakerProvider(
+		payments.NewHTTPProvider(providerURL, chargeTimeout),
+		breakerCfg, logger,
+	)
+	worker := payments.NewWorker(store, provider, logger, workerCfg)
 
 	logger.Info("payments started",
 		"topic", topic, "group", payments.ConsumerName, "provider", providerURL,
-		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout)
+		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout,
+		"backoff_base", workerCfg.BackoffBase, "max_backoff", workerCfg.MaxBackoff,
+		"escalate_after", workerCfg.EscalateAfter,
+		"breaker_trip_after", breakerCfg.TripAfter, "breaker_open_timeout", breakerCfg.OpenTimeout)
 
 	// Run both. If either stops, cancel the other, then wait for it too.
 	errs := make(chan error, 2)

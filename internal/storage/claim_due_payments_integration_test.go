@@ -11,7 +11,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const testLease = 30 * time.Second
+const (
+	testLease       = 30 * time.Second
+	testBackoffBase = 5 * time.Second
+	testMaxBackoff  = 60 * time.Second
+)
 
 func insertBookingWithStatus(t *testing.T, status string) uuid.UUID {
 	t.Helper()
@@ -54,7 +58,7 @@ func TestClaimDuePaymentsOnlyPaymentPending(t *testing.T) {
 	insertBookingWithStatus(t, "confirmed")
 	insertBookingWithStatus(t, "cancelled")
 
-	due, err := store.ClaimDuePayments(context.Background(), 10, testLease)
+	due, err := store.ClaimDuePayments(context.Background(), 10, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -76,12 +80,12 @@ func TestClaimDuePaymentsLeaseHidesBooking(t *testing.T) {
 	ctx := context.Background()
 	insertBookingWithStatus(t, "payment_pending")
 
-	first, err := store.ClaimDuePayments(ctx, 10, testLease)
+	first, err := store.ClaimDuePayments(ctx, 10, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first claim: got %d bookings, err %v; want 1", len(first), err)
 	}
 
-	second, err := store.ClaimDuePayments(ctx, 10, testLease)
+	second, err := store.ClaimDuePayments(ctx, 10, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -98,14 +102,14 @@ func TestClaimDuePaymentsExpiredLeaseIsDueAgain(t *testing.T) {
 	ctx := context.Background()
 	id := insertBookingWithStatus(t, "payment_pending")
 
-	if _, err := store.ClaimDuePayments(ctx, 10, testLease); err != nil {
+	if _, err := store.ClaimDuePayments(ctx, 10, testLease, testBackoffBase, testMaxBackoff); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 
 	// Simulate the lease running out, without sleeping in the test.
 	exec(t, `UPDATE bookings SET next_attempt_at = now() - interval '1 second' WHERE booking_id = $1`, id)
 
-	again, err := store.ClaimDuePayments(ctx, 10, testLease)
+	again, err := store.ClaimDuePayments(ctx, 10, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil {
 		t.Fatalf("claim after lease: %v", err)
 	}
@@ -124,7 +128,7 @@ func TestClaimDuePaymentsDoesNotTouchUpdatedAt(t *testing.T) {
 	entered := time.Now().Add(-10 * time.Minute).Truncate(time.Microsecond)
 	exec(t, `UPDATE bookings SET updated_at = $2 WHERE booking_id = $1`, id, entered)
 
-	due, err := store.ClaimDuePayments(context.Background(), 10, testLease)
+	due, err := store.ClaimDuePayments(context.Background(), 10, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("claim: got %d bookings, err %v; want 1", len(due), err)
 	}
@@ -154,7 +158,7 @@ func TestClaimDuePaymentsOldestFirstWithinLimit(t *testing.T) {
 	exec(t, `UPDATE bookings SET next_attempt_at = now() - interval '2 minutes' WHERE booking_id = $1`, middle)
 	exec(t, `UPDATE bookings SET next_attempt_at = now() - interval '1 minute'  WHERE booking_id = $1`, newest)
 
-	due, err := store.ClaimDuePayments(context.Background(), 2, testLease)
+	due, err := store.ClaimDuePayments(context.Background(), 2, testLease, testBackoffBase, testMaxBackoff)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -184,7 +188,7 @@ func TestClaimDuePaymentsConcurrentClaimsAreDisjoint(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			<-start
-			results[w], errs[w] = store.ClaimDuePayments(context.Background(), total, testLease)
+			results[w], errs[w] = store.ClaimDuePayments(context.Background(), total, testLease, testBackoffBase, testMaxBackoff)
 		}(w)
 	}
 	close(start)
@@ -220,4 +224,106 @@ func containsAll(ids []uuid.UUID, want ...uuid.UUID) bool {
 		}
 	}
 	return true
+}
+
+func paymentAttempts(t *testing.T, id uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT payment_attempts FROM bookings WHERE booking_id = $1`, id).Scan(&n); err != nil {
+		t.Fatalf("read payment_attempts: %v", err)
+	}
+	return n
+}
+
+// secondsUntilNextAttempt measures the delay the claim scheduled, using the
+// database's clock so test and database can't disagree.
+func secondsUntilNextAttempt(t *testing.T, id uuid.UUID) float64 {
+	t.Helper()
+	var s float64
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT EXTRACT(EPOCH FROM next_attempt_at - now()) FROM bookings WHERE booking_id = $1`, id,
+	).Scan(&s); err != nil {
+		t.Fatalf("read next_attempt_at: %v", err)
+	}
+	return s
+}
+
+// Each claim counts as one attempt.
+func TestClaimDuePaymentsCountsAttempts(t *testing.T) {
+	resetDB(t)
+	store := NewStore(testPool)
+	ctx := context.Background()
+	id := insertBookingWithStatus(t, "payment_pending")
+
+	for want := 1; want <= 2; want++ {
+		if _, err := store.ClaimDuePayments(ctx, 10, testLease, testBackoffBase, testMaxBackoff); err != nil {
+			t.Fatalf("claim %d: %v", want, err)
+		}
+		if got := paymentAttempts(t, id); got != want {
+			t.Errorf("after claim %d: payment_attempts = %d, want %d", want, got, want)
+		}
+		exec(t, `UPDATE bookings SET next_attempt_at = now() - interval '1 second' WHERE booking_id = $1`, id)
+	}
+}
+
+// The next attempt is always at least the full lease away, and at most
+// lease + the capped backoff, whatever the attempt count.
+func TestClaimDuePaymentsDelayStaysWithinBounds(t *testing.T) {
+	const slack = 1.0 // seconds: time passing between the claim and our read
+	lease := testLease.Seconds()
+
+	tests := []struct {
+		name     string
+		attempts int
+		maxDelay float64
+	}{
+		{"first attempt", 0, lease + testBackoffBase.Seconds()}, // 30 + 5×2⁰
+		{"many attempts", 10, lease + testMaxBackoff.Seconds()}, // 5×2¹⁰ is capped at 60
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDB(t)
+			store := NewStore(testPool)
+			id := insertBookingWithStatus(t, "payment_pending")
+			exec(t, `UPDATE bookings SET payment_attempts = $2 WHERE booking_id = $1`, id, tt.attempts)
+
+			if _, err := store.ClaimDuePayments(context.Background(), 10, testLease, testBackoffBase, testMaxBackoff); err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+
+			delay := secondsUntilNextAttempt(t, id)
+			if delay < lease-slack || delay > tt.maxDelay {
+				t.Errorf("delay: got %.1fs, want between %.0fs and %.0fs", delay, lease, tt.maxDelay)
+			}
+		})
+	}
+}
+
+// The backoff really grows: after many attempts, delays spread well beyond
+// what a first attempt could ever get. Checked over many bookings, because a
+// single random draw could land low by chance.
+func TestClaimDuePaymentsBackoffGrowsWithAttempts(t *testing.T) {
+	resetDB(t)
+	store := NewStore(testPool)
+
+	const n = 20
+	ids := make([]uuid.UUID, n)
+	for i := range ids {
+		ids[i] = insertBookingWithStatus(t, "payment_pending")
+	}
+	exec(t, `UPDATE bookings SET payment_attempts = 10 WHERE booking_status = 'payment_pending'`)
+
+	if _, err := store.ClaimDuePayments(context.Background(), n, testLease, testBackoffBase, testMaxBackoff); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	firstAttemptMax := (testLease + testBackoffBase).Seconds() // 35s
+	for _, id := range ids {
+		if secondsUntilNextAttempt(t, id) > firstAttemptMax {
+			return // at least one delay exceeds anything a first attempt could get
+		}
+	}
+	t.Errorf("none of %d delays exceeded %.0fs: the backoff isn't growing", n, firstAttemptMax)
 }

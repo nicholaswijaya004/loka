@@ -1111,3 +1111,150 @@ lease for later bookings, so the batch runs in parallel.
 - The expiry job
 - An escalation alert
 - The provider-down and worker-crash experiments
+
+## Day 19
+
+### What I built
+
+- **Exponential backoff with full jitter for payment retries:** a
+  `payment_attempts` column, and a new `SET` in `ClaimDuePayments`.
+- **A circuit breaker around the payment provider:** `BreakerProvider`, a
+  decorator using `sony/gobreaker`.
+- **The outage experiment,** which proved both working together.
+
+### Prediction before measuring
+
+For the outage experiment:
+[fill in: how many calls before the breaker opens; what the worker logs while
+it's open; whether retry times are spread out; what happens when the 30 s ends;
+how long recovery takes; how many charges per booking]
+
+### What happened
+
+- **The breaker opened after the 5th failure,** but 6 calls got through, since
+  the batch had already started them in parallel.
+- **While open, calls failed instantly,** without touching the network.
+- **Every 30 s, one probe was sent.** It failed, and the breaker reopened.
+- **Retries spread further apart each round.**
+- **When the paymock came back,** the next probe succeeded, the breaker closed,
+  and all 6 bookings were confirmed over 48 s. One charge each.
+
+### What I understand now
+
+**Jitter stops a herd.** Clients that fail at the same moment retry at the same
+moment unless something randomises them.
+
+**Retries are selfish.** Each one helps one caller, but adds load to a service
+that's already struggling. Retrying at several layers multiplies it: 3 layers ×
+3 retries = 27 calls. Loka retries a charge in exactly one place, the worker's
+lease. `HTTPProvider` and the paymock don't retry.
+
+**The jitter variants** (from Brooker's _Exponential Backoff And Jitter_), with
+`temp = min(cap, base × 2^attempt)`:
+
+- **full:** `random(0, temp)`;
+- **equal:** `temp/2 + random(0, temp/2)`;
+- **decorrelated:** based on the _previous_ sleep, not the attempt number.
+
+I first mixed up full and decorrelated.
+
+**Exponential backoff needs the attempt number,** and a stateless worker can't
+remember it, so it lives on the booking. `next_attempt_at` alone only says
+_when_, not _how many_.
+
+**"The larger of the lease and the backoff" silently switched jitter off.** For
+early attempts the lease always won, so a batch claimed together retried at the
+exact same moment, the herd jitter exists to prevent. Adding the jitter **on
+top of** the lease keeps the lease guarantee and spreads every retry. Lesson:
+when combining two rules with max/min, check what each one does across the
+whole range.
+
+**The backoff cap must stay well below the escalation threshold.** Escalation
+is only checked after an attempt, so a long gap between attempts would delay
+the alert, not just the retry.
+
+**In one `UPDATE`, every `SET` reads the old row,** so the backoff sees the
+attempt count before this attempt's increment. `RETURNING` shows the new row.
+
+**Two separate questions about every error:**
+
+1. **Should it be retried?** The worker decides.
+2. **Is the provider unhealthy?** The breaker decides.
+
+|                                   | Retry?            | Unhealthy? |
+| --------------------------------- | ----------------- | ---------- |
+| declined                          | no, it's a result | no         |
+| timeout, `5xx`                    | yes               | yes        |
+| `400`, unrecognised response      | no, escalate      | no         |
+| our shutdown (`context.Canceled`) | yes               | no         |
+
+A breaker that counts declines would block good cards because of empty ones.
+
+**One breaker per provider, shared by every call.** A per-goroutine breaker sees
+one call and can never trip. At Traveloka, the Resilience4j breaker was a shared
+bean too; goroutines are like threads.
+
+**Decorator versus adapter:**
+
+- An **adapter** makes a shape fit, and is _required_ (`storeAdapter`).
+- A **decorator** keeps the same shape and _adds_ behaviour, and is _optional_
+  (`BreakerProvider`, `failOutboxStore`).
+
+Removing the breaker still compiles; it only loses the protection.
+
+**`gobreaker` is the engine; `BreakerProvider` is the decorator.** The library
+knows nothing about payments. It decides whether any function may run.
+
+**The breaker and the retry schedule are separate clocks.**
+
+- The breaker's open timeout decides _whether calls may go through_.
+- Each booking's `next_attempt_at` decides _when that booking shows up_.
+
+The half-open probe is simply the first call after the cooldown.
+
+**In Go, an interface call hides which method runs.** `w.provider.Charge` runs
+`BreakerProvider.Charge` because of what `main.go` stored in the field. A text
+search won't find it; "Go to Implementations" will.
+
+### Things that went wrong
+
+- The first migration put `payment_attemps` (typo) on `payments` instead of
+  `bookings`, with an invalid down migration (`DROP ALTER TABLE`).
+- SQL written like Go:
+  - `rand(0, x)` instead of `random() * x`;
+  - `min(a, b)` (an aggregate) instead of `least(a, b)`;
+  - adding a number to `now()` instead of converting to an interval.
+- The tests failed with a syntax error, then passed with no SQL change. The
+  earlier run compiled an unsaved or older file. `go test` reads the disk, not
+  the editor.
+- Put `&d.Attempts` (a pointer) in a `%d` error message, then a value that's
+  meaningless after a failed `Scan`.
+- A parameter named `cap` shadowed Go's built-in.
+- `BackOffBase` next to `MaxBackoff`. Also: if `main.go` hadn't set them, the
+  zero values would have silently disabled the backoff.
+- VS Code on this Mac didn't know the `integration` tag, like Neovim on Day 12.
+- Thought the breaker would read `next_attempt_at`, and that it would be one per
+  goroutine.
+- Counted unrecognised responses and `context.Canceled` as provider failures.
+
+### Questions I should be able to answer
+
+- Why does jitter matter, and why is retrying at several layers dangerous?
+- Full, equal and decorrelated jitter: what's the difference?
+- Why is the attempt count a column, and why is jitter added to the lease
+  rather than taking the larger of the two?
+- Why must the backoff cap stay below the escalation threshold?
+- What are a breaker's three states, and what moves between them?
+- Which errors count against the provider, and why not declines or
+  cancellations?
+- Why one breaker per provider, and not per call?
+- Decorator versus adapter: which is `BreakerProvider`, and how do you know?
+- In the outage run, why did 6 calls reach the provider before the breaker
+  opened?
+
+### Still open
+
+- Validate the config at startup
+- Skip claims while the breaker is open
+- A failure-ratio trip
+- Breaker metrics and alerting
