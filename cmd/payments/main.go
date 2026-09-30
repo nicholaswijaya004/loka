@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/nicholaswijaya004/loka/internal/booking"
 	"github.com/nicholaswijaya004/loka/internal/consumer"
 	"github.com/nicholaswijaya004/loka/internal/payments"
 	"github.com/nicholaswijaya004/loka/internal/storage"
@@ -39,6 +40,13 @@ var workerCfg = payments.WorkerConfig{
 	EscalateAfter: 30 * time.Minute,
 	BackoffBase:   5 * time.Second,
 	MaxBackoff:    5 * time.Minute,
+}
+
+// The expirer's deadline comes from BOOKING_EXPIRE_AFTER; the chaos test sets
+// it short so bookings actually expire during a run.
+var expirerCfg = booking.ExpirerConfig{
+	BatchSize: 50,
+	Interval:  5 * time.Second,
 }
 
 // The breaker opens after 5 consecutive provider failures, stays open for
@@ -68,12 +76,18 @@ func run() error {
 	topic := envOr("KAFKA_TOPIC", "booking-events")
 	providerURL := envOr("PAYMENT_PROVIDER_URL", "http://localhost:8081")
 
+	expireAfter, err := time.ParseDuration(envOr("BOOKING_EXPIRE_AFTER", "15m"))
+	if err != nil || expireAfter <= 0 {
+		return fmt.Errorf("BOOKING_EXPIRE_AFTER: want a positive duration like 15m, got %q", os.Getenv("BOOKING_EXPIRE_AFTER"))
+	}
+	expirerCfg.After = expireAfter
+
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return fmt.Errorf("parse dsn: %w", err)
 	}
 	// One connection per parallel charge's outcome, plus the consumer and claims.
-	cfg.MaxConns = int32(workerCfg.BatchSize) + 4
+	cfg.MaxConns = int32(workerCfg.BatchSize) + 5
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -110,25 +124,35 @@ func run() error {
 		breakerCfg, logger,
 	)
 	worker := payments.NewWorker(store, provider, logger, workerCfg)
+	expirer := booking.NewExpirer(store, logger, expirerCfg)
 
 	logger.Info("payments started",
 		"topic", topic, "group", payments.ConsumerName, "provider", providerURL,
 		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout,
 		"backoff_base", workerCfg.BackoffBase, "max_backoff", workerCfg.MaxBackoff,
 		"escalate_after", workerCfg.EscalateAfter,
-		"breaker_trip_after", breakerCfg.TripAfter, "breaker_open_timeout", breakerCfg.OpenTimeout)
+		"breaker_trip_after", breakerCfg.TripAfter, "breaker_open_timeout", breakerCfg.OpenTimeout, "expire_after", expirerCfg.After, "expire_batch_size", expirerCfg.BatchSize,
+		"expire_interval", expirerCfg.Interval)
 
-	// Run both. If either stops, cancel the other, then wait for it too.
-	errs := make(chan error, 2)
-	go func() { errs <- sagaStarter.Run(ctx, client) }()
-	go func() { errs <- worker.Run(ctx) }()
+	// Run all three. If any stops, cancel the others, then wait for them too.
+	runners := []func() error{
+		func() error { return sagaStarter.Run(ctx, client) },
+		func() error { return worker.Run(ctx) },
+		func() error { return expirer.Run(ctx) },
+	}
+	errs := make(chan error, len(runners))
+	for _, run := range runners {
+		go func() { errs <- run() }()
+	}
 
-	first := <-errs
+	results := []error{<-errs}
 	stop()
-	second := <-errs
+	for range len(runners) - 1 {
+		results = append(results, <-errs)
+	}
 
 	logger.Info("payments stopped")
-	return errors.Join(first, second)
+	return errors.Join(results...)
 }
 
 func envOr(key, fallback string) string {

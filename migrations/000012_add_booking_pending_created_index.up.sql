@@ -1,0 +1,1 @@
+CREATE INDEX idx_bookings_pending_created ON bookings (created_at) WHERE booking_status = 'pending';

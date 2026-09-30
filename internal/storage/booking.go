@@ -29,6 +29,13 @@ type Booking struct {
 	UpdatedAt     time.Time
 }
 
+type ExpiredBooking struct {
+	BookingID  uuid.UUID
+	UnitID     uuid.UUID
+	CustomerID uuid.UUID
+	Qty        int
+}
+
 var failAfterDecrement = func() float64 {
 	f, err := strconv.ParseFloat(os.Getenv("FAIL_AFTER_DECREMENT"), 64)
 	if err != nil {
@@ -108,4 +115,50 @@ func (s *Store) TransitionBookingStatus(ctx context.Context, id uuid.UUID, from,
 		return ErrBookingNotFound
 	}
 	return fmt.Errorf("%w: booking %s is not %s", ErrStatusConflict, id, from)
+}
+
+// ExpirePendingBookings cancels up to limit pending bookings created more than
+// olderThan ago, oldest first, with reason "expired". It does not release
+// seats or write events: run it in the same transaction as both.
+//
+// The deadline is checked against Postgres's clock, the one that wrote
+// created_at. SKIP LOCKED lets concurrent expirers take disjoint batches.
+func (s *Store) ExpirePendingBookings(ctx context.Context, olderThan time.Duration, limit int) ([]ExpiredBooking, error) {
+	rows, err := s.db.Query(ctx, `
+		WITH expired AS (
+			SELECT booking_id
+			FROM bookings
+			WHERE booking_status = 'pending'
+			  AND created_at < now() - $1 * interval '1 second'
+			ORDER BY created_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE bookings b
+		SET booking_status = 'cancelled',
+		    cancelled_at   = now(),
+		    updated_at     = now(),
+		    failure_reason = 'expired'
+		FROM expired
+		WHERE b.booking_id = expired.booking_id
+		  AND b.booking_status = 'pending'
+		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty
+	`, int(olderThan.Seconds()), limit)
+	if err != nil {
+		return nil, fmt.Errorf("expire pending bookings: %w", err)
+	}
+	defer rows.Close()
+
+	var expired []ExpiredBooking
+	for rows.Next() {
+		var e ExpiredBooking
+		if err := rows.Scan(&e.BookingID, &e.UnitID, &e.CustomerID, &e.Qty); err != nil {
+			return nil, fmt.Errorf("scan expired booking: %w", err)
+		}
+		expired = append(expired, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read expired bookings: %w", err)
+	}
+	return expired, nil
 }

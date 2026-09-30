@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Implementation starts Day 18.
 **Date:** 2026-09-25
+**Updated:** 2026-09-30 (Day 20): the expirer, the saga's timeout path (section 3).
 **Builds on:**
 
 - ADR-001: data model and constraints;
@@ -64,7 +65,7 @@ be succeeding right now.
 
 ## Decision
 
-The saga is split into two components with different jobs.
+The saga is split into three components with different jobs.
 
 ### 1. The payments consumer: starts the saga
 
@@ -129,6 +130,93 @@ worker therefore:
 - leaves it for **reconciliation**: a human checks with the provider, and applies
   the right transition.
 
+### 3. The expirer: the timeout path
+
+A polling loop (`booking.Expirer`), run as a goroutine in `cmd/payments`. Every
+5 s it cancels up to 50 `pending` bookings created more than
+`BOOKING_EXPIRE_AFTER` ago (default 15 min).
+
+**One batch, one transaction:**
+
+| Step | Write                                                                                    | Why it must be in the transaction                             |
+| ---- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| 1    | `pending → cancelled`, `failure_reason = 'expired'`, for the whole batch in one `UPDATE` | first: if it doesn't happen, nothing else may                 |
+| 2    | release seats, **summed per unit, in `unit_id` order**                                   | a transition without its release leaks seats forever          |
+| 3    | one `booking.cancelled` outbox event per booking, `reason: "expired"`                    | a transition without its event is invisible to every consumer |
+
+**No `payments` row.** The `payments` table records facts about money: what the
+provider said about a charge. An expired booking was still `pending`, so no
+charge was ever attempted, and there is nothing to record.
+
+**Only `pending`, never `payment_pending`.** In `payment_pending` Loka doesn't
+know whether the customer has been charged: the request may have succeeded with
+its response lost. Expiring it would release a seat the customer may have paid
+for. **Only a known outcome can end a charge in flight; a timeout is not an
+outcome.** Those bookings are the worker's, and go to escalation.
+
+**The deadline is `created_at + BOOKING_EXPIRE_AFTER`, worked out at query
+time.** There's no `expires_at` column.
+
+- **Cost:** changing the config changes the deadline for bookings that already
+  exist.
+- **Why that's acceptable:** in Loka the charge starts automatically, so the
+  customer never sees or acts on a deadline.
+- **Revisit** if customers ever pay themselves (bank transfer, "pay by 14:32"),
+  or if different bookings need different deadlines.
+
+**Postgres's clock, not Go's.** `created_at` is written by Postgres `now()`, so
+the comparison uses it too:
+`created_at < now() - $1 * interval '1 second'`, with the duration passed in
+from Go. Comparing it with an app server's clock mixes two clocks: a server
+running fast expires bookings early, and two servers disagree.
+
+**The race with the payments consumer.** Both try to move the same `pending`
+booking at once. The compare-and-set on `booking_status` lets exactly one win:
+
+- **The expirer wins:** the consumer's `pending → payment_pending` gets
+  `ErrStatusConflict`, logs "booking not pending, payment not started", and
+  marks the event processed. **No charge is made.**
+- **The consumer wins:** the booking no longer matches `booking_status =
+'pending'`, so the expirer skips it. It must not publish anything: the worker
+  owns that booking and writes its outcome event.
+
+**Two expirers are safe** (e.g. two replicas of `cmd/payments`):
+
+- `FOR UPDATE SKIP LOCKED` gives them disjoint batches, and the compare-and-set
+  means each booking is expired once;
+- releasing in `unit_id` order means they lock inventory rows in the same order,
+  so they can't deadlock. A Go map's order differs on every run.
+
+**`checkTransition` is called once per batch.** The pair
+`pending → cancelled` is the same for every row; the per-row check is the
+`WHERE`. Keeping the expirer in the `booking` package keeps `checkTransition`
+unexported: every status change still goes through the package that owns the
+state machine.
+
+**Policy: our own outage does not expire bookings.** Because the expirer runs
+inside `cmd/payments`:
+
+- **relay or Kafka down:** the expirer keeps running and frees seats;
+- **`cmd/payments` down:** it's down too, and seats stay held until it comes
+  back. The outage is ours, so the customer isn't punished for it;
+- **after a restart:** the consumer's backlog and the expirer race. It stays
+  correct thanks to the compare-and-set, but which bookings survive is
+  effectively random.
+
+**Choosing the deadline.** In Loka the deadline means "how long we hold a seat
+while our own pipeline is stuck." It must be far above:
+
+- a healthy booking's time from insert to `payment_pending` (about the relay's
+  500 ms poll plus consumer lag: around a second, to be measured under load);
+- a routine restart or deploy of the relay or `cmd/payments` (seconds to a minute).
+
+15 minutes clears both by a wide margin. The chaos test uses 60 s, so expiry
+actually happens during a run.
+
+**Index:** `idx_bookings_pending_created ON bookings (created_at) WHERE
+booking_status = 'pending'` (migration 12). The query must write `'pending'` as
+a literal, or the planner can't use the partial index.
+
 ## Why compensation is safe
 
 **Compensation is not rollback.** The seat decrement committed when the booking
@@ -155,15 +243,19 @@ level: the partial unique index on `payments (booking_id) WHERE payment_status =
 
 ## Failure scenarios
 
-| What happens                                             | Result                                                                                                                                     |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| The consumer crashes before committing `payment_pending` | the event is redelivered, the claim is retried, and the transition happens once                                                            |
-| The worker crashes after charging, before recording      | the booking stays `payment_pending`, the next poll charges again with the same key, the provider replays, and the outcome is recorded once |
-| The provider times out, but the charge succeeded         | the same as above: resolved on a later poll                                                                                                |
-| The provider is down for a long time                     | the booking stays `payment_pending`, is retried, then escalated past the threshold. Never cancelled blind                                  |
-| Two workers pick the same booking                        | both charge with the same key and get one charge. One wins the transition; the other gets `ErrStatusConflict` and rolls back               |
-| Expiry runs while a charge is in flight                  | expiry only matches `pending`. The booking is `payment_pending`, so nothing happens                                                        |
-| The same decline is processed twice                      | the second transition conflicts, so there's no second release, no second row, and no second event                                          |
+| What happens                                             | Result                                                                                                                                                                         |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| The consumer crashes before committing `payment_pending` | the event is redelivered, the claim is retried, and the transition happens once                                                                                                |
+| The worker crashes after charging, before recording      | the booking stays `payment_pending`, the next poll charges again with the same key, the provider replays, and the outcome is recorded once                                     |
+| The provider times out, but the charge succeeded         | the same as above: resolved on a later poll                                                                                                                                    |
+| The provider is down for a long time                     | the booking stays `payment_pending`, is retried, then escalated past the threshold. Never cancelled blind                                                                      |
+| Two workers pick the same booking                        | both charge with the same key and get one charge. One wins the transition; the other gets `ErrStatusConflict` and rolls back                                                   |
+| Expiry runs while a charge is in flight                  | expiry only matches `pending`. The booking is `payment_pending`, so nothing happens                                                                                            |
+| The same decline is processed twice                      | the second transition conflicts, so there's no second release, no second row, and no second event                                                                              |
+| The relay is down longer than the deadline               | `pending` bookings expire and release their seats. When the relay returns, their `booking.created` is published, the consumer gets `ErrStatusConflict`, and nothing is charged |
+| The expirer and the consumer move one booking at once    | the compare-and-set lets one win; the other changes nothing                                                                                                                    |
+| Two expirers run at once                                 | `SKIP LOCKED` gives disjoint batches; `unit_id` order prevents deadlocks; each booking expires, and releases its seats, once                                                   |
+| An expiry batch fails halfway (e.g. the outbox insert)   | the whole transaction rolls back: bookings stay `pending` and keep their seats, and the next poll tries again                                                                  |
 
 ## Alternatives considered
 
@@ -188,7 +280,7 @@ level: the partial unique index on `payments (booking_id) WHERE payment_status =
 
 **Costs and obligations:**
 
-- **Two new components to run and monitor:** the payments consumer and the payment worker.
+- **Three components to run and monitor:** the payments consumer, the payment worker, and the expirer (all in `cmd/payments`).
 - **The worker must poll efficiently.** It needs an index that finds `payment_pending` bookings, like the outbox's partial index.
 - **Two workers may charge the same booking at once.** That's safe, thanks to the key, but wasteful. `FOR UPDATE SKIP LOCKED` while _selecting_ reduces it. The lock is released before the charge, so it's an optimisation, not the guarantee.
 - **The idempotency key is the booking ID,** which means one payment attempt per booking. Letting a customer retry with a different card needs a new key scheme, e.g. `booking_id` plus attempt number.
@@ -197,7 +289,7 @@ level: the partial unique index on `payments (booking_id) WHERE payment_status =
 ## Open
 
 - **A provider lookup** (`GET /charges/{key}`) for recovery, which asks "did it happen?" without creating a charge for bookings that were never charged.
-- **The expiry job** (`pending → cancelled`, with a seat release), and its deadline.
-- **The retry and escalation thresholds:** values, and where they're configured.
+- **Customer cancel during `payment_pending`:** the charge must be resolved first (lookup, then void or refund), then cancel and release. Never a direct cancel.
 - **Refunds** after confirmation.
 - **A dead-letter topic** for poison messages (from Day 16).
+- **Measure the healthy `pending` duration at p99 under load,** to back the 15-minute deadline with a number.
