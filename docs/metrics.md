@@ -1011,3 +1011,84 @@ Without the breaker, all 37 would have.
 - Consider a failure-ratio trip, for providers that fail only intermittently
 - Breaker state as a metric, and an alert on "open"
 - Remove or generalise the `pgErr.Position` debug branch in `ClaimDuePayments`
+
+## Day 20
+
+**Goal:** Build the saga's timeout path (the original plan's Day 23–25 "timeout
+path", skipped on Days 17–18): expire `pending` bookings past a deadline and
+release their seats. Prove it with a relay outage.
+
+**Settings:**
+
+| Setting                           | Value                        | Constraint                                                  |
+| --------------------------------- | ---------------------------- | ----------------------------------------------------------- |
+| deadline (`BOOKING_EXPIRE_AFTER`) | 15 min (60 s in experiments) | ≫ healthy insert → `payment_pending`; > a routine restart   |
+| poll interval                     | 5 s                          |                                                             |
+| batch size                        | 50                           | small: the batch holds hot inventory row locks until commit |
+| clock                             | Postgres `now()`             | the clock that wrote `created_at`                           |
+
+**Built:**
+
+- **Migration 12:** partial index `idx_bookings_pending_created ON bookings (created_at) WHERE booking_status = 'pending'`.
+- **`storage.ExpirePendingBookings`:** a CTE picks the oldest expired `pending` bookings (`FOR UPDATE SKIP LOCKED`), and one `UPDATE … FROM` cancels them with `failure_reason = 'expired'`, returning `booking_id`, `unit_id`, `customer_id` and `qty`.
+- **`booking.Expirer`:** `checkTransition` once per batch; then, in one transaction, the query, seat releases summed per unit in `unit_id` order, and one `booking.cancelled` event per booking. No payment row.
+- **`booking.CancelledPayload`:** the `booking.cancelled` schema moved from `payments` into `booking`, so the worker and the expirer write the same shape.
+- **`cmd/payments`:** runs the expirer as a third goroutine; reads `BOOKING_EXPIRE_AFTER` and refuses to start on a bad value; one more pool connection.
+
+**Tests added:**
+
+| Package               | Proves                                                                                                                                                                                                                                                                                                                                                                                                      | Result    |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| storage (integration) | only `pending` bookings past the deadline expire (a fresh `pending`, and old `payment_pending` / `confirmed` / `cancelled`, are untouched); status, `failure_reason` and `cancelled_at` are set; oldest first within the limit; a second call finds nothing; two concurrent calls are disjoint and cover everything                                                                                         | ✓ `-race` |
+| booking (integration) | seats come back summed per unit, on every unit; exactly one `booking.cancelled` event per booking with reason `expired`; no payment rows; fresh and `payment_pending` bookings keep status and seats; a second run changes nothing; an outbox failure rolls back the transition and the release; two concurrent expirers with small batches across two units release every seat exactly once, with no error | ✓ `-race` |
+
+**Checked that the tests catch bugs:**
+
+| Deliberate bug                                | Caught by                                                                      |
+| --------------------------------------------- | ------------------------------------------------------------------------------ |
+| seats released outside the transaction        | `TestExpirerWritesNothingWhenEventFails` (available 10, want 8)                |
+| `FOR UPDATE SKIP LOCKED` removed from the CTE | `TestExpirerConcurrentRunsReleaseEachSeatOnce` (`ErrOverRelease`, seats wrong) |
+
+The storage-level concurrency test did **not** catch the second bug: its two
+calls rarely overlap in time. The booking-level test loops with small batches,
+so it does.
+
+**Experiment: relay down past the deadline.** `BOOKING_EXPIRE_AFTER=60s`, paymock
+with no declines and no lost responses, unit `2222…` (10 seats).
+
+| Time        | Event                                                                      |
+| ----------- | -------------------------------------------------------------------------- |
+| 19:50:08    | control booking, relay running: `confirmed` by the next check (14 s later) |
+| —           | relay stopped                                                              |
+| 19:50:53–57 | batch A: 3 bookings                                                        |
+| 19:51:55–57 | batch B: 2 bookings                                                        |
+| ~19:52:07   | check 1: A (70–73 s old) `cancelled` / `expired`; B (9–11 s) `pending`     |
+| [fill in]   | relay restarted, before B reached 60 s                                     |
+| ~19:53:03   | check 2: all published; B `confirmed`; A still `cancelled`                 |
+
+| Check | `available_units`      | outbox unpublished                         | payments                  |
+| ----- | ---------------------- | ------------------------------------------ | ------------------------- |
+| 1     | 7 = 10 − 1 − 3 − 2 + 3 | 5 `booking.created`, 3 `booking.cancelled` | 1 succeeded (control)     |
+| 2     | 7 = 10 − 3 confirmed   | 0                                          | 3 succeeded (control + B) |
+
+T4 on relay restart, for each batch A booking:
+[fill in: paste the three "booking not pending, payment not started" lines]
+
+**Result:**
+
+- Batch A expired, released its seats, and was **never charged**: 0 payment rows. Its late `booking.created` lost the race to the expirer.
+- Batch B, inside the deadline, carried on and was confirmed.
+- Invariants held: available = total − confirmed (S2); no payment for a cancelled booking (S3); nothing left `pending` or `payment_pending` (L1); every event published (E1).
+
+**Observations:**
+
+- **The outbox kept the expiry events while the relay was down.** The expirer's transaction only needs Postgres, so it keeps working through a relay or Kafka outage; the events go out when the relay returns.
+- **Batch A's `booking.created` was published after it had already expired.** That is exactly the Q4 race, happening for real.
+- **Batch B was created 62 s after A, not the planned 30 s.** It worked only because the relay came back before B turned 60 s old.
+- **The control run doesn't measure healthy latency:** "confirmed within 14 s" is only when I looked.
+
+**Open:**
+
+- Measure healthy insert → `payment_pending` at p99 under load (the chaos test)
+- Expiry count as a metric; alert on a spike (a pipeline outage shows up as expiries)
+- Customer cancel during `payment_pending` (needs the provider lookup)

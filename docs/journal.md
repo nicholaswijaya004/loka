@@ -1258,3 +1258,141 @@ search won't find it; "Go to Implementations" will.
 - Skip claims while the breaker is open
 - A failure-ratio trip
 - Breaker metrics and alerting
+
+## Day 20
+
+### What I built
+
+The saga's timeout path, skipped on Days 17–18:
+
+- a partial index on `pending` bookings by `created_at`;
+- `ExpirePendingBookings`: one query that claims and cancels a batch;
+- `booking.Expirer`: cancels, releases seats per unit in a fixed order, and
+  writes `booking.cancelled`, all in one transaction;
+- the expirer as a third loop in `cmd/payments`, configured by
+  `BOOKING_EXPIRE_AFTER`;
+- the `booking.cancelled` payload moved into `booking`, shared with the worker.
+
+I wrote the tests first this time, and watched them fail before the code
+existed.
+
+### Prediction before measuring
+
+For the relay-outage experiment:
+[fill in honestly: I didn't write predictions before running. What would I have
+said for: the status of batch A and B at 70 s; available units; unpublished
+outbox rows; what T4 logs when the relay comes back; payment rows at the end?]
+
+### What happened
+
+- **Batch A expired at 60 s** and released its 3 seats, while the relay was
+  still down. Its `booking.cancelled` events waited in the outbox.
+- **When the relay came back,** batch A's `booking.created` events were
+  published late. The consumer found the bookings already `cancelled`, backed
+  off, and charged nothing: 0 payment rows for A.
+- **Batch B, inside the deadline,** was confirmed normally.
+- Seats ended at 7 = 10 − 3 confirmed.
+
+### What I understand now
+
+**The compare-and-set decides races, not the idempotency key.** I first said
+the idempotency key stops the expirer and the consumer from both moving a
+booking. It doesn't: Loka's keys stop duplicate API requests and duplicate
+charges. What decides is `WHERE booking_status = 'pending'`: both `UPDATE`s hit
+the same row, the second waits for the lock, re-checks the `WHERE` after the
+first commits (READ COMMITTED), matches 0 rows, and gets `ErrStatusConflict`.
+
+**Whoever makes a transition publishes its event, in the same transaction.**
+I said that if the consumer wins, the expirer should publish "paid". Wrong
+twice: `payment_pending` doesn't mean paid (the charge could still be
+declined, and then there'd be a "paid" and a "cancelled" event for one
+booking), and the expirer doesn't own that transition, so it has nothing to
+say.
+
+**A timeout is not an outcome.** I got "don't expire `payment_pending`" right,
+but for a business reason (a lost sale, not our fault). The real reason is
+correctness: in `payment_pending`, Loka doesn't know whether the customer was
+charged. Cancelling means acting on a guess. If the guess is wrong, the
+customer has paid for a seat someone else can now buy. Only a known outcome
+may end a charge in flight. The same rule is why the worker never cancels on a
+timeout.
+
+**Compare timestamps with the clock that wrote them.** I wanted Go's
+`time.Now()`. `created_at` comes from Postgres, so an app server's clock would
+mix two clocks: a fast server expires bookings early, and two servers
+disagree. The rule stays in Go (the duration); only the clock reading is
+Postgres's.
+
+**The `payments` table records facts about money.** A decline is a fact: a
+charge was attempted, and the provider refused. An expiry isn't: no charge was
+ever attempted. So `cancel()` inserts a payment row, and expiry must not.
+
+**Lock order prevents deadlocks.** A batch spanning two units locks two
+inventory rows. Two expirers taking them in opposite orders deadlock
+(Postgres aborts one with `40P01`). Sorting by `unit_id` gives everyone the
+same order. A Go map's iteration order is randomised on purpose, so "whatever
+order the map gives" is no order.
+
+**Batch the work, check the rule once.** One `UPDATE` for the whole batch, one
+seat release per unit instead of per booking, and one `checkTransition` per
+batch, because the pair `pending → cancelled` is the same for every row. The
+per-row check is the `WHERE`.
+
+**A partial index needs the literal.** The planner uses
+`WHERE booking_status = 'pending'` only if the query says `'pending'` too, not
+`$3`.
+
+**Where a loop runs decides what goes down with it.** In `cmd/payments`, the
+expirer stops when the consumer stops, so our own outage doesn't expire
+bookings. That's a policy, and it has a cost: seats stay held during the
+outage, and after a restart the backlog and the expirer race.
+
+**Borrowed numbers need re-justifying.** 15–30 minutes at Traveloka is how
+long a customer has to go and pay. Loka has no such step: the deadline here
+means "how long we hold a seat while our own pipeline is stuck." Same number,
+different meaning.
+
+**Why test first.** A test that has never failed proves nothing: it might pass
+whatever the code does. Writing it first shows it failing, turns the Block 1
+decisions into checks before I build the thing, and tells me when I'm done.
+Breaking the code on purpose (release outside the transaction, no
+`SKIP LOCKED`) confirmed the right tests fail.
+
+**A struct per query result, not a half-filled `Booking`.** Returning four
+fields in a 13-field struct leaves zero values that look like data.
+`ExpiredBooking`, like `DuePayment`, holds exactly what the caller uses.
+
+### Things that went wrong
+
+- Q2: chose Go's clock, then hesitated. I was on the right track.
+- Q4: credited the idempotency key with deciding the race, and wanted the
+  expirer to publish "paid" when it loses.
+- Q6: mixed up payment retries with expiry ("retry when the server restarts").
+- Q7: justified 15 minutes with Traveloka's number instead of Loka's.
+- Forgot the `migrate create` command; ran migrations with Postgres not
+  started (`connection refused`).
+- Skipped writing predictions before the experiment, and didn't save T4's logs.
+- Batch B was created 62 s after A instead of 30 s. It nearly expired too.
+
+### Questions I should be able to answer
+
+- Why does expiry only touch `pending`, never `payment_pending`?
+- What guarantees exactly one winner when the expirer and the consumer move the
+  same booking? What does each side do when it loses?
+- Why must the transition, the seat release and the event be in one
+  transaction? What breaks if each one is missing?
+- Why does a decline insert a payment row, and an expiry doesn't?
+- Why compare `created_at` with Postgres `now()`, not Go's `time.Now()`?
+- `created_at + config` versus an `expires_at` column: what does each cost?
+- How can two expirers deadlock, and how does sorting prevent it?
+- Why is `checkTransition` called once per batch, and what protects each row?
+- Why does the expirer run inside `cmd/payments`, and what is the cost of that?
+- How did you choose 15 minutes, and what does the deadline mean in Loka?
+- Why write the test before the code?
+
+### Still open
+
+- The chaos test (Days 21–22), with M2's new check: at least one booking actually expired
+- Measure healthy insert → `payment_pending` at p99 under load
+- An expiry metric and alert
+- Customer cancel during `payment_pending`
