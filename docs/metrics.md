@@ -1056,23 +1056,25 @@ so it does.
 **Experiment: relay down past the deadline.** `BOOKING_EXPIRE_AFTER=60s`, paymock
 with no declines and no lost responses, unit `2222…` (10 seats).
 
-| Time        | Event                                                                      |
-| ----------- | -------------------------------------------------------------------------- |
-| 19:50:08    | control booking, relay running: `confirmed` by the next check (14 s later) |
-| —           | relay stopped                                                              |
-| 19:50:53–57 | batch A: 3 bookings                                                        |
-| 19:51:55–57 | batch B: 2 bookings                                                        |
-| ~19:52:07   | check 1: A (70–73 s old) `cancelled` / `expired`; B (9–11 s) `pending`     |
-| [fill in]   | relay restarted, before B reached 60 s                                     |
-| ~19:53:03   | check 2: all published; B `confirmed`; A still `cancelled`                 |
+| Time              | Event                                                                                                                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------- | --- |
+| 19:50:08          | control booking, relay running: `confirmed` by the next check (14 s later)                                                 |
+| —                 | relay stopped                                                                                                              |
+| 19:50:53–57       | batch A: 3 bookings                                                                                                        |
+| 19:51:55–57       | batch B: 2 bookings                                                                                                        |
+| ~19:52:07         | check 1: A (70–73 s old) `cancelled` / `expired`; B (9–11 s) `pending`                                                     |
+| 19:52:07–19:52:55 | relay restarted (time not recorded; after check 1, and before batch B turned 60 s old, since B was confirmed, not expired) |     |
+| ~19:53:03         | check 2: all published; B `confirmed`; A still `cancelled`                                                                 |
 
 | Check | `available_units`      | outbox unpublished                         | payments                  |
 | ----- | ---------------------- | ------------------------------------------ | ------------------------- |
 | 1     | 7 = 10 − 1 − 3 − 2 + 3 | 5 `booking.created`, 3 `booking.cancelled` | 1 succeeded (control)     |
 | 2     | 7 = 10 − 3 confirmed   | 0                                          | 3 succeeded (control + B) |
 
-T4 on relay restart, for each batch A booking:
-[fill in: paste the three "booking not pending, payment not started" lines]
+T4 on relay restart: not saved before the terminal was closed. The indirect
+evidence is above: batch A has 0 payment rows, and every `booking.created`
+was processed. The chaos harness now keeps one log file per process start,
+so this can't be lost again.
 
 **Result:**
 
@@ -1092,3 +1094,127 @@ T4 on relay restart, for each batch A booking:
 - Measure healthy insert → `payment_pending` at p99 under load (the chaos test)
 - Expiry count as a metric; alert on a spike (a pipeline outage shows up as expiries)
 - Customer cancel during `payment_pending` (needs the provider lookup)
+
+## Days 21–22
+
+**Goal:** Automate the chaos test from the original plan (Days 27–28): real
+binaries under load, the relay and `cmd/payments` killed mid-run, 30% declines
+and 10% lost responses, then check every invariant after the system drains.
+Scale it to 10,000 bookings.
+
+**Built:**
+
+- **Paymock ledger:** `GET /charges` lists every charge with `idempotency_key`,
+  `booking_id`, `lost_response` and `calls`. `POST /charges` answers are
+  unchanged (`chargeRecord` embeds `chargeResponse`; only the embedded part is
+  sent).
+- **The chaos harness (`internal/chaos`, build tag `chaos`):** builds the four
+  binaries once, starts them with `os/exec`, sends paced load, kills processes
+  with SIGKILL on a schedule, waits for the drain, checks the invariants.
+  `CHAOS_BOOKINGS` and `CHAOS_RATE` set the size.
+- **Worker: batches → slots.** `Worker.Run` keeps up to `MaxInFlight` charges
+  in flight and refills a slot as soon as it frees, instead of claiming a batch
+  and waiting for all of it. `BatchSize` became `MaxInFlight` (still 10).
+- **The worker's first tests** (with a fake provider), closing the Day 18 open
+  item.
+- **Deferred from Day 20:** the worker uses `booking.CancelledPayload`;
+  `make up` waits for the healthchecks (`--wait`).
+
+**Invariants checked after every run:**
+
+| Group    | Checks                                                                                                                                                             | Source                        |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
+| Safety   | S1 available ≥ 0 · S2 available = total − confirmed seats · S3 / S3b / S4 payments per booking · S7/E2 one created + one matching outcome event                    | Postgres                      |
+| Provider | S5 one successful charge per booking · S6 charged ⇔ confirmed · S6b declined ⇔ cancelled as declined                                                               | Paymock ledger vs Postgres    |
+| Events   | E1 all published · E3/E4 outbox ids = `processed_events` ids for `payments`, both directions                                                                       | Postgres                      |
+| Liveness | L1 nothing `pending` or `payment_pending`                                                                                                                          | Postgres                      |
+| Validity | M1 every 201 exists, DB count within 201s … 201s + unknown · M2 ≥ 1 of each: relay restart, payments restart, lost response, replay, decline, expiry, confirmation | Load result, ledger, Postgres |
+
+**Chaos schedule** (triggers are shares of the load, so they land mid-traffic
+at any size):
+
+| At  | Fault                                                     |
+| --- | --------------------------------------------------------- |
+| 10% | SIGKILL `cmd/payments`, back after 5 s                    |
+| 25% | SIGKILL the relay, back after 5 s                         |
+| 40% | relay down until 5 more bookings expire (state, not time) |
+| 75% | SIGKILL `cmd/payments`, back after 5 s                    |
+
+Settings: `BOOKING_EXPIRE_AFTER=30s`, `DECLINE_RATE=0.3`, `LOST_RESPONSE_RATE=0.1`,
+20 units with 2× the seats the load needs.
+
+**Tests added:**
+
+| Package                | Proves                                                                                                                                                                                                                                                               | Result          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| payments (integration) | a hung charge holds only its own slot while the others confirm (**fails on the batch design**); never more than `MaxInFlight` charges at once, and they do overlap; `Run` returns only after charges in flight end, and an unanswered charge stays `payment_pending` | ✓ (×3, `-race`) |
+| chaos (`-tags=chaos`)  | all invariants above, under the schedule above                                                                                                                                                                                                                       | ✓ 1k and 10k    |
+
+**Worker fix, 1,000 bookings at 5/s** (same chaos, same 10-way concurrency;
+only the scheduling changed):
+
+| Machine     | Worker | Drain after load | Whole test | Confirmed / declined / expired | Charges / calls | Lost = retried | Violations |
+| ----------- | ------ | ---------------- | ---------- | ------------------------------ | --------------- | -------------- | ---------- |
+| container   | batch  | 290.8 s          | 521 s      | 607 / 266 / 128                | 873 / 934       | 61 = 61        | 0          |
+| container   | batch  | 300.0 s          | 536 s      | 609 / 260 / 132                | 869 / 935       | 66 = 66        | 0          |
+| container   | slots  | **78.9 s**       | 300 s      | 578 / 269 / 154                | 847 / 914       | 67 = 67        | 0          |
+| MacBook Pro | slots  | **71.2 s**       | 300 s      | 592 / 241 / 168                | 833 / 888       | 55 = 55        | 0          |
+| MacBook Pro | slots  | **79.4 s**       | 308 s      | 588 / 246 / 167                | 834 / 899       | 65 = 65        | 0          |
+
+Drain −73 to −75%. Provider calls during a batch-design run: about 1.9/s
+against 5 bookings/s arriving.
+
+**10,000 bookings at 25/s** (slots, `MaxInFlight` 10):
+
+| Machine     | Load  | Work left 30 s after load | Drain after load | Whole test | Confirmed / declined / expired | Charges / calls | Lost = retried | Violations |
+| ----------- | ----- | ------------------------- | ---------------- | ---------- | ------------------------------ | --------------- | -------------- | ---------- |
+| container   | 400 s | 4,289                     | 334.7 s          | 767 s      | 6,498 / 2,771 / 732            | 9,269 / 9,902   | 633 = 633      | 0          |
+| MacBook Pro | 400 s | 3,304                     | 317.9 s          | 789 s      | 6,312 / 2,543 / 1,146          | 8,855 / 9,452   | 597 = 597      | **0**      |
+
+In every run, charges = confirmed + declined exactly: no expired booking
+reached the provider.
+
+**Mac 10k timeline:**
+
+| Time    | Event                                                |
+| ------- | ---------------------------------------------------- |
+| 40.1 s  | kill payments                                        |
+| 100.0 s | kill relay                                           |
+| 160.1 s | relay down until 5 more expire (549 already expired) |
+| 192.3 s | relay back (32 s outage)                             |
+| 300.0 s | kill payments                                        |
+| 400.1 s | load finished: 10,000 created, 0 errors, 0 unknown   |
+| 430.7 s | 3,304 units of work left                             |
+| 674.3 s | 30 left                                              |
+| 718.0 s | drained                                              |
+
+**Observations:**
+
+- **A SIGKILLed consumer blocks its partitions for about 45 s.** It never
+  leaves the group, so the broker waits for the session timeout. The new
+  process is up in 5 s but consumes nothing until then. With a 30 s deadline,
+  every booking that arrives in that gap expires: the expirer log showed bursts
+  of 25 every 5 s (5 bookings/s × 5 s poll) starting about 35 s after each
+  kill.
+- **The batch worker suffered head-of-line blocking.** P(a batch of 10 has a
+  lost response) ≈ 1 − 0.9¹⁰ ≈ 65%, and a lost response holds the batch for
+  the full 10 s timeout. That works out to about 1.5–1.9 charges/s, which
+  matches the measured value.
+- **Only successful new charges can lose their response,** so 6.8% of charges
+  were lost at 10k, not 10%. The average slot time is about 0.7 s, so 10 slots
+  give about 13–15 charges/s: measured 13.2/s on the Mac.
+- **At 10k the worker is capacity-bound,** not blocked: about 13/s against
+  about 21/s needing a charge. The backlog grows during the load and then
+  shrinks at a steady rate, never stalling.
+- **Expiries vary from run to run** (128–168 at 1k, 732–1,146 at 10k). They
+  depend on when each kill lands relative to Kafka's heartbeats, not on the
+  worker.
+
+**Open:**
+
+- Tune `MaxInFlight` against the provider's real concurrency limit (a separate
+  experiment from the scheduling fix)
+- Shorten the consumer's rejoin after a crash (static group membership or a
+  lower session timeout), and measure how much expiry drops
+- An expiry-rate metric and alert: a spike means the pipeline stalled
+- Run the 1k chaos test in CI (nightly, not on every PR)
