@@ -34,7 +34,7 @@ const (
 )
 
 var workerCfg = payments.WorkerConfig{
-	BatchSize:     10,
+	MaxInFlight:   10,
 	Interval:      500 * time.Millisecond,
 	Lease:         30 * time.Second,
 	EscalateAfter: 30 * time.Minute,
@@ -86,8 +86,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("parse dsn: %w", err)
 	}
-	// One connection per parallel charge's outcome, plus the consumer and claims.
-	cfg.MaxConns = int32(workerCfg.BatchSize) + 5
+	// One connection per charge in flight to record its outcome, plus the
+	// consumer, claims and the expirer.
+	cfg.MaxConns = int32(workerCfg.MaxInFlight) + 5
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -128,7 +129,7 @@ func run() error {
 
 	logger.Info("payments started",
 		"topic", topic, "group", payments.ConsumerName, "provider", providerURL,
-		"batch_size", workerCfg.BatchSize, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout,
+		"max_in_flight", workerCfg.MaxInFlight, "lease", workerCfg.Lease, "charge_timeout", chargeTimeout,
 		"backoff_base", workerCfg.BackoffBase, "max_backoff", workerCfg.MaxBackoff,
 		"escalate_after", workerCfg.EscalateAfter,
 		"breaker_trip_after", breakerCfg.TripAfter, "breaker_open_timeout", breakerCfg.OpenTimeout, "expire_after", expirerCfg.After, "expire_batch_size", expirerCfg.BatchSize,

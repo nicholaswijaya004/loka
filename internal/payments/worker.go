@@ -18,7 +18,6 @@ import (
 const (
 	aggregateBooking      = "booking"
 	eventBookingConfirmed = "booking.confirmed"
-	eventBookingCancelled = "booking.cancelled"
 	outcomeEventVersion   = 1
 )
 
@@ -32,22 +31,14 @@ type bookingConfirmedPayload struct {
 	ConfirmedAt time.Time `json:"confirmed_at"`
 }
 
-type bookingCancelledPayload struct {
-	Version     int       `json:"version"`
-	BookingID   uuid.UUID `json:"booking_id"`
-	CustomerID  uuid.UUID `json:"customer_id"`
-	Reason      string    `json:"reason"`
-	CancelledAt time.Time `json:"cancelled_at"`
-}
-
-// WorkerConfig holds the worker's numbers. The provider's timeout must be
-// shorter than Lease, and a batch is charged in parallel so that it finishes
-// within one timeout, well inside its lease. After a failed attempt, the next
-// try is Lease plus a jittered backoff that grows from BackoffBase up to
+// WorkerConfig holds the worker's numbers. MaxInFlight is how many charges
+// run at once. Each booking is charged as soon as it is claimed, so the
+// provider's timeout must be shorter than Lease. After a failed attempt, the
+// next try is Lease plus a jittered backoff that grows from BackoffBase up to
 // MaxBackoff; Lease + MaxBackoff must stay well below EscalateAfter, or
 // escalation is delayed.
 type WorkerConfig struct {
-	BatchSize     int
+	MaxInFlight   int
 	Interval      time.Duration
 	Lease         time.Duration
 	EscalateAfter time.Duration
@@ -66,29 +57,6 @@ type Worker struct {
 
 func NewWorker(store *storage.Store, provider Provider, logger *slog.Logger, cfg WorkerConfig) *Worker {
 	return &Worker{store: store, provider: provider, logger: logger, cfg: cfg}
-}
-
-// RunOnce claims one batch and processes it. It returns how many bookings
-// were claimed, so Run knows whether more may be waiting. Per-booking
-// problems are handled and logged here; the only error returned is failing
-// to claim at all.
-func (w *Worker) RunOnce(ctx context.Context) (int, error) {
-	due, err := w.store.ClaimDuePayments(ctx, w.cfg.BatchSize, w.cfg.Lease, w.cfg.BackoffBase, w.cfg.MaxBackoff)
-	if err != nil {
-		return 0, fmt.Errorf("claim due payments: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	for _, d := range due {
-		wg.Add(1)
-		go func(d storage.DuePayment) {
-			defer wg.Done()
-			w.processOne(ctx, d)
-		}(d)
-	}
-	wg.Wait()
-
-	return len(due), nil
 }
 
 // processOne charges one booking and acts on the answer. It never cancels a
@@ -213,8 +181,8 @@ func cancel(ctx context.Context, tx *storage.Store, d storage.DuePayment, res *C
 		return err
 	}
 
-	return insertEvent(ctx, tx, d.BookingID, eventBookingCancelled, bookingCancelledPayload{
-		Version:     outcomeEventVersion,
+	return insertEvent(ctx, tx, d.BookingID, booking.EventBookingCancelled, booking.CancelledPayload{
+		Version:     booking.CancelledEventVersion,
 		BookingID:   d.BookingID,
 		CustomerID:  d.CustomerID,
 		Reason:      reason,
@@ -235,18 +203,48 @@ func insertEvent(ctx context.Context, tx *storage.Store, bookingID uuid.UUID, ev
 	})
 }
 
-// Run polls until ctx is cancelled. A full batch means more may be waiting,
-// so it polls again immediately; otherwise it sleeps for the interval.
+// Run keeps up to MaxInFlight charges going until ctx is cancelled. Each
+// charge holds one slot, and a freed slot is refilled at once, so a charge
+// that hangs until its timeout (a lost response) holds only its own slot.
+// Charging a batch and waiting for all of it would let that one charge stall
+// every booking behind it.
+//
+// It claims only as many bookings as there are free slots, so a claimed
+// booking starts charging immediately and its lease isn't spent in a queue.
+// On shutdown it waits for the charges in flight to finish or give up.
 func (w *Worker) Run(ctx context.Context) error {
+	slots := make(chan struct{}, w.cfg.MaxInFlight) // one token per running charge
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	for {
-		n, err := w.RunOnce(ctx)
-		if ctx.Err() != nil {
+		free, ok := acquireSlots(ctx, slots)
+		if !ok {
 			return nil
 		}
-		if err != nil {
-			w.logger.Error("payment worker batch failed", "error", err)
+
+		due, err := w.store.ClaimDuePayments(ctx, free, w.cfg.Lease, w.cfg.BackoffBase, w.cfg.MaxBackoff)
+		if err != nil && ctx.Err() == nil {
+			w.logger.Error("claim due payments", "error", err)
 		}
-		if err == nil && n == w.cfg.BatchSize {
+		for _, d := range due {
+			wg.Add(1)
+			go func() {
+				defer func() {
+					<-slots
+					wg.Done()
+				}()
+				w.processOne(ctx, d)
+			}()
+		}
+		// Give back the slots nothing was claimed for.
+		for range free - len(due) {
+			<-slots
+		}
+
+		// Every free slot was filled, so more may be due: claim again as soon
+		// as a slot frees. Otherwise nothing more is due right now.
+		if err == nil && len(due) == free {
 			continue
 		}
 		select {
@@ -255,4 +253,25 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-time.After(w.cfg.Interval):
 		}
 	}
+}
+
+// acquireSlots waits until one slot is free, then takes every other slot
+// that is free right now, and returns how many it holds. It reports false if
+// ctx ends first.
+func acquireSlots(ctx context.Context, slots chan struct{}) (int, bool) {
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return 0, false
+	}
+	n := 1
+	for n < cap(slots) {
+		select {
+		case slots <- struct{}{}:
+			n++
+		default:
+			return n, true
+		}
+	}
+	return n, true
 }

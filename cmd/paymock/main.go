@@ -2,6 +2,8 @@
 // is not part of Loka. POST /charges is idempotent on the Idempotency-Key
 // header, and environment knobs make it slow, decline, or succeed without the
 // caller hearing back in time.
+// GET /charges lists every charge (the ledger), for the chaos test's
+// provider-side checks.
 //
 // Knobs (defaults behave perfectly):
 //
@@ -45,11 +47,19 @@ type chargeResponse struct {
 
 type chargeStore struct {
 	mu      sync.Mutex
-	charges map[string]chargeResponse
+	charges map[string]chargeRecord
+}
+
+type chargeRecord struct {
+	chargeResponse
+	IdempotencyKey string    `json:"idempotency_key"`
+	BookingID      uuid.UUID `json:"booking_id"`
+	LostResponse   bool      `json:"lost_response"`
+	Calls          int       `json:"calls"`
 }
 
 func newChargeStore() *chargeStore {
-	return &chargeStore{charges: make(map[string]chargeResponse)}
+	return &chargeStore{charges: make(map[string]chargeRecord)}
 }
 
 type knobs struct {
@@ -74,6 +84,10 @@ func main() {
 
 	store := newChargeStore()
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /charges", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, store.snapshot())
+	})
 
 	mux.HandleFunc("POST /charges", func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -112,20 +126,25 @@ func main() {
 		// never sets it, so a retry is always answered promptly.
 		var lostResponse bool
 
-		result, existed := store.getOrCreate(key, func() chargeResponse {
-			resp := chargeResponse{ChargeID: uuid.New()}
-
-			if rand.Float64() < k.declineRate {
-				resp.PaymentStatus = "declined"
-				resp.FailureReason = "insufficient_funds"
-				return resp
+		result, existed := store.getOrCreate(key, func() chargeRecord {
+			rec := chargeRecord{
+				chargeResponse: chargeResponse{ChargeID: uuid.New()},
+				IdempotencyKey: key,
+				BookingID:      req.BookingID,
 			}
 
-			resp.PaymentStatus = "succeeded"
+			if rand.Float64() < k.declineRate {
+				rec.PaymentStatus = "declined"
+				rec.FailureReason = "insufficient_funds"
+				return rec
+			}
+
+			rec.PaymentStatus = "succeeded"
 			// The money is taken either way; this only decides whether the
 			// caller hears about it in time.
 			lostResponse = rand.Float64() < k.lostRate
-			return resp
+			rec.LostResponse = lostResponse
+			return rec
 		})
 
 		logger.Info("charge",
@@ -144,7 +163,7 @@ func main() {
 		if existed {
 			w.Header().Set("Idempotent-Replay", "true")
 		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, result.chargeResponse)
 	})
 
 	srv := &http.Server{
@@ -235,13 +254,16 @@ func envRate(key string) (float64, error) {
 	return f, nil
 }
 
-func (s *chargeStore) getOrCreate(key string, create func() chargeResponse) (chargeResponse, bool) {
+func (s *chargeStore) getOrCreate(key string, create func() chargeRecord) (chargeRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.charges[key]; ok {
+		r.Calls++
+		s.charges[key] = r // r is a copy; without this the count never changes
 		return r, true
 	}
 	r := create()
+	r.Calls = 1
 	s.charges[key] = r
 	return r, false
 }
@@ -267,4 +289,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// snapshot returns a copy of every charge, safe to use after the lock is released.
+func (s *chargeStore) snapshot() []chargeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]chargeRecord, 0, len(s.charges))
+	for _, r := range s.charges {
+		out = append(out, r)
+	}
+	return out
 }

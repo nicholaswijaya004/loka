@@ -1282,6 +1282,9 @@ For the relay-outage experiment:
 [fill in honestly: I didn't write predictions before running. What would I have
 said for: the status of batch A and B at 70 s; available units; unpublished
 outbox rows; what T4 logs when the relay comes back; payment rows at the end?]
+I didn't write predictions before running this experiment, so there is
+nothing to compare. Lesson: write them before the first command, not after
+the results.
 
 ### What happened
 
@@ -1396,3 +1399,140 @@ fields in a 13-field struct leaves zero values that look like data.
 - Measure healthy insert → `payment_pending` at p99 under load
 - An expiry metric and alert
 - Customer cancel during `payment_pending`
+
+## Days 21–22
+
+### What I built
+
+- **A ledger in paymock** (`GET /charges`), so the test can check the
+  provider's side: Loka's tables can look perfect while a customer was
+  charged twice.
+- **An automated chaos test:** the four real binaries, paced load, SIGKILLs on
+  a schedule, a drain, and 15 invariants checked against Postgres and the
+  ledger. It runs at 1k by default and at 10k with two environment variables.
+- **A rewrite of the payment worker's loop,** from "claim a batch, wait for
+  all of it" to "keep up to N charges in flight, refill each slot as it
+  frees", plus the worker's first tests.
+
+### Prediction before measuring
+
+[fill in honestly, or write "not written before the runs": for the 1k run,
+the drain time and whether any invariant would fail; for the 10k run, the
+work left when the load ended, the drain time, and whether anything would
+break or only slow down]
+
+### What happened
+
+- **The first 1k run passed, but one fault never happened.** The "relay down
+  until 5 bookings expire" phase ended after 0.2 s, because 5 had already
+  expired, after the first `cmd/payments` kill.
+- **Every 1k run took about 5 minutes to drain after a 200 s load.** The
+  worker managed about 1.9 charges/s while bookings arrived at 5/s.
+- **After the worker fix,** the same run drained in 71–79 s: −75%, with the
+  same 10-way concurrency.
+- **10,000 bookings at 25/s passed on my Mac:** 6,312 confirmed, 2,543
+  declined, 1,146 expired, 0 violations. The worker was still slower than the
+  arrivals, and the backlog drained steadily in 318 s.
+
+### What I understand now
+
+**A crashed Kafka consumer still holds its partitions.** SIGKILL means it never
+says "I'm leaving", so the broker waits for the session timeout (about 45 s)
+before reassigning. My replacement was up in 5 s and consumed nothing for 40 s
+more. So the expiry deadline must be well above _restart time + session
+timeout_, not just restart time. 15 minutes is; 30 s isn't.
+
+**Head-of-line blocking.** A batch that waits for all its members runs at the
+speed of its slowest member. With 10% lost responses, about 65% of batches of
+10 contained one, and that one held 9 idle slots for 10 s. The fix was the
+scheduling, not more concurrency: slots, refilled one at a time. Same 10-way
+concurrency, drain −75%.
+
+**A buffered channel is a semaphore.** `make(chan struct{}, N)`: sending takes
+a slot and blocks when all N are taken; receiving frees one. `struct{}` costs
+nothing.
+
+**Claim only as many as you can run.** A claimed booking's lease starts
+ticking at the claim. Claiming more than the free slots would spend leases in
+a queue, and an expired lease lets another worker take the same booking.
+
+**Change one variable per experiment.** I kept `MaxInFlight` = the old
+`BatchSize` (10), so the before/after measures the scheduling alone. Raising
+concurrency is a different question: how much will the provider accept?
+
+**Drain time = backlog ÷ throughput + the slowest single path.** My first
+`drainTimeout` only had the second term. It was fine at 1k and would have
+failed at 10k. A stall timeout ("has any work finished in the last 8
+minutes?") fits a backlog of any size and still catches a stuck system.
+Progress means beating the best so far, because recording an outcome briefly
+_adds_ work (an event to publish and to process).
+
+**A chaos test must prove the chaos happened.** M2 fails the run if there
+wasn't at least one restart, lost response, replay, decline, expiry and
+confirmation. Otherwise a green run could just mean the faults missed.
+
+**Wait for states, not times.** Faults trigger at a share of the load, the
+long outage ends when bookings have expired, and the harness waits for
+readiness before going on. A slower machine makes the run longer, not flaky.
+The same goes for `make up`: `--wait` for the healthchecks, or `migrate` hits
+a Postgres that isn't ready (`EOF`).
+
+**SIGKILL, not SIGTERM, for chaos.** SIGTERM runs my graceful shutdown, the
+happy path. A crash gives no chance to commit offsets or finish a batch, and
+that's what has to be safe.
+
+**Fresh topic per run.** The reset restarts outbox ids at 1. On a reused
+topic, old events with the same ids would make `processed_events` skip the
+new ones.
+
+**`t.Fatalf` only from the test goroutine.** It calls `runtime.Goexit`, which
+stops the goroutine it's on. Load workers report results; the test decides.
+
+**A client timeout is an unknown outcome too.** M1 accepts between "201s" and
+"201s + transport errors", the lost-response problem on the client side.
+
+**`count(column)`, not `count(*)`, after a `LEFT JOIN`.** The NULL-filled row
+for "no match" counts as 1 in `count(*)`.
+
+**The numbers explained themselves.** Lost responses = retries in every run
+(each retried once with the same key, replayed, never charged twice).
+Charges = confirmed + declined in every run (expired bookings never reached
+the provider). Only successful new charges can lose their response, which is
+why 6.8% were lost, not 10%.
+
+### Things that went wrong
+
+- `make up && make migrate-up` failed with `EOF`: `docker compose up -d`
+  returns when containers start, not when Postgres is ready.
+- Pressed Ctrl-C on a run that was just quiet between chaos phases.
+- Phase 3 ended in 0.2 s on the first run: it counted total expiries, not new
+  ones.
+- The drain timeout was derived per booking and ignored the backlog.
+- Started the paymock change on `main` and had to branch before committing.
+- Planned 10k with 2,000 seats: it would have sold out. Caught before running.
+- Wanted to write the load generator myself, then had it written instead.
+- [fill in: predictions, if skipped again]
+
+### Questions I should be able to answer
+
+- Why does a chaos test need provider-side checks as well as database checks?
+- What does M2 protect against?
+- Why did bookings expire after a 5 s `cmd/payments` crash with a 30 s
+  deadline? What does that mean for the production deadline?
+- What is head-of-line blocking, and how did 1 lost response in 10 cut
+  throughput to about 1.9/s?
+- How does a buffered channel work as a semaphore?
+- Why does the worker claim only as many bookings as it has free slots?
+- Why keep `MaxInFlight` at 10 for the before/after?
+- Why a stall timeout instead of a fixed drain deadline?
+- Why SIGKILL and not SIGTERM? Why a fresh topic per run?
+- At 10k, why was the worker still slower than the arrivals, and why is that
+  not the same problem as before?
+
+### Still open
+
+- Tune `MaxInFlight` against the provider's concurrency limit
+- Shorten consumer rejoin after a crash (static membership / session timeout)
+- An expiry-rate metric and alert
+- The 1k chaos test as a nightly CI job
+- Customer cancel during `payment_pending`; the provider lookup endpoint
