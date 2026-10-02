@@ -1218,3 +1218,170 @@ reached the provider.
   lower session timeout), and measure how much expiry drops
 - An expiry-rate metric and alert: a spike means the pipeline stalled
 - Run the 1k chaos test in CI (nightly, not on every PR)
+
+## Day 23
+
+**Goal:** Distributed tracing with OpenTelemetry: follow one booking through
+every service and every async hop (HTTP, outbox, Kafka, the booking row,
+HTTP to the provider) in a single trace, then use the traces to find where
+the time goes.
+
+**Settings:**
+
+| Setting     | Value                                     | Why                                                                            |
+| ----------- | ----------------------------------------- | ------------------------------------------------------------------------------ |
+| backend     | Jaeger v2 (`jaegertracing/jaeger:2.21.0`) | OTLP in (gRPC 4317, HTTP 4318), UI on 16686                                    |
+| exporter    | OTLP gRPC, batched                        | spans leave in the background, every 5 s or when the batch fills               |
+| sampler     | `ParentBased(AlwaysSample())`             | follow the caller's decision; production: `TraceIDRatioBased` or tail sampling |
+| propagation | W3C `traceparent`                         | one format for HTTP headers, Kafka headers and the JSONB columns               |
+| on failure  | best effort                               | export errors go to `slog`; requests never wait for or fail on telemetry       |
+
+**Built:**
+
+- **`internal/telemetry`:** `Setup(ctx, service, logger)` (provider, resource
+  `service.name`, sampler, propagator, error handler → `slog`; returns the
+  flush), `Inject(ctx) map[string]string` (`nil` when there is no span) and
+  `Extract(ctx, map) ctx`.
+- **API:** `otelhttp` per route (`POST /bookings`, `GET /bookings/{id}`),
+  `otelpgx` on the pool (a span per statement, plus `pool.acquire`).
+- **Migration 13:** `trace_context JSONB` on `outbox_events` and `bookings`.
+  The booking transaction stores the request's span on both rows.
+- **Relay:** one `publish <event type>` span per event (kind Producer), parent
+  read from `outbox_events.trace_context`; `newRecord` puts the relay's own
+  span into the Kafka headers.
+- **Consumer:** `Process` starts `process <event type>` (kind Consumer) from
+  the Kafka headers; a redelivery is marked `duplicate=true`, a failure is an
+  error span.
+- **Worker:** `processOne` starts `charge booking` per attempt, parent read
+  from `bookings.trace_context` (choice A); `payment.attempt`,
+  `payment.outcome`; error only when the system failed (no answer, permanent
+  error, stuck, record failed), never for a decline. Outcome events carry the
+  charge span.
+- **Expirer:** one `expire booking` span per booking in that booking's trace,
+  ended **after** the batch transaction, so a rollback is an error and never
+  a claimed expiry. Each `booking.cancelled` event carries its own booking's
+  span.
+- **Payments → paymock:** `otelhttp.NewTransport` on the provider client
+  (client span `POST /charges` + `traceparent` header); paymock wraps
+  `POST /charges` in `otelhttp.NewHandler` and adds `booking.id`,
+  `charge.status`, `charge.replay`, `charge.lost_response`.
+- **Setup in every binary:** `api` exits if tracing can't start; `relay`,
+  `payments` and `paymock` log it and run without tracing.
+- **Fix found from a trace:** `defer client.CloseAllowingRebalance()` in
+  `cmd/payments` and `cmd/notifier` (see the rebalance table below).
+
+**Tests added:**
+
+| Package                       | Proves                                                                                                                                               | Result              |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| telemetry (unit)              | inject → extract keeps the trace; a span from extracted context is a child; no span → `nil`; nil, empty or invalid headers leave ctx unchanged       | ✓ 4                 |
+| booking (integration)         | every strategy stores the request's exact `traceparent` on the booking and outbox rows; no span → SQL `NULL`                                         | ✓ 2 (×4 strategies) |
+| relay (unit)                  | the Kafka record carries the relay's span, not the stored one; no trace → no trace headers; key and value unchanged                                  | ✓ 3                 |
+| relay (integration)           | `publish` continues the stored trace; a failed publish is an error span; an event without a trace still publishes                                    | ✓ 3                 |
+| consumer (integration)        | `process` is a child of the publish span and the handler sees it; a redelivery is `duplicate=true`; a failure is an error span                       | ✓ 3                 |
+| booking expirer (integration) | each booking in one batch gets a span in its own trace and its event carries it; no stored trace → a root span; a rollback marks the spans as errors | ✓ 3                 |
+| payments (unit)               | a charge sends the caller's trace in `traceparent`; no span → no header                                                                              | ✓ 2                 |
+
+All with `-race`. Each new test was checked against a deliberately broken
+version of the code it covers, and failed.
+
+**One booking, warm, everything running** (`eb567d73`, 1.24 s end to end):
+
+| Span                                 | Starts   | Takes   | Wait before it | The wait is |
+| ------------------------------------ | -------- | ------- | -------------- | ----------- |
+| api `POST /bookings`                 | 0 ms     | small   |                |             |
+| relay `publish booking.created`      | 181 ms   | 16.6 ms | ~170 ms        | relay poll  |
+| payments `process booking.created`   | 202 ms   | 13.8 ms | ~5 ms          | Kafka       |
+| payments `charge booking`            | 688 ms   | 43.8 ms | **~470 ms**    | worker poll |
+| relay `publish booking.confirmed`    | 1,220 ms | 5.1 ms  | **~490 ms**    | relay poll  |
+| payments `process booking.confirmed` | 1,230 ms | 8.5 ms  | ~5 ms          | Kafka       |
+
+About 1.13 s of 1.24 s (**~90%**) is waiting for a poll. A hop through Kafka
+costs ~5 ms; a hop through a polled table costs up to one interval (500 ms).
+
+**API `POST /bookings`:**
+
+| Case                             | Spans            | Duration | Note                                       |
+| -------------------------------- | ---------------- | -------- | ------------------------------------------ |
+| cold (first request after start) | 19               | 81 ms    | a nested prepare span under each statement |
+| cold, pool's first connection    | 25 (whole trace) | 404 ms   | `connect` alone 88 ms                      |
+| warm                             | 13               | 24–33 ms | statement cache hit: no prepare spans      |
+
+Warm breakdown (`24f2b4b9`, 32.9 ms), one `pool.acquire` per database step:
+
+| Step                          | Statements                                      | Time   |
+| ----------------------------- | ----------------------------------------------- | ------ |
+| claim the idempotency key     | `INSERT`                                        | 6.6 ms |
+| read                          | `SELECT`                                        | 2.6 ms |
+| the booking transaction       | `BEGIN`, `UPDATE`, `INSERT`, `INSERT`, `COMMIT` | ~14 ms |
+| store the idempotent response | `UPDATE`                                        | 5.6 ms |
+
+The idempotency layer is 2 of the 4 steps and about a third of the time.
+
+**Jaeger down:** the booking still returned 201; the exporter logged its error
+about 12 s later; that trace was lost. Telemetry never blocks a request.
+
+**Relay `publish` after idle:** 338 ms after about 2 h idle, 16–22 ms warm.
+Likely a reconnect (Kafka closes idle connections after about 10 min);
+not verified.
+
+**Consumer restart before / after `CloseAllowingRebalance`:**
+
+| Trace      | Old process stopped (killed by 2nd Ctrl-C) | + 45 s session timeout | `process booking.created` actually ran |
+| ---------- | ------------------------------------------ | ---------------------- | -------------------------------------- |
+| `79642ff2` | ~01:18:30 (inferred)                       | ~01:19:15              | 01:19:14.8                             |
+| `24f2b4b9` | ~01:44:52 (inferred)                       | ~01:45:37              | 01:45:36.7                             |
+| `c478e94d` | 01:50:40.3 (logged)                        | **01:51:25.3**         | **≈ 01:51:25.6**                       |
+
+|                               | Before                                                    | After                                        |
+| ----------------------------- | --------------------------------------------------------- | -------------------------------------------- |
+| Ctrl-C                        | logs `payments stopped`, then hangs until a second Ctrl-C | exits on its own                             |
+| Group right after shutdown    | dead member stays until its session times out             | `has no active members`                      |
+| Start → first booking charged | waits for old shutdown + 45 s                             | **5.7 s** (≤ 3 s group join + poll + charge) |
+
+**Lost response** (`LOST_RESPONSE_RATE=1`, charge timeout 10 s, lease 30 s,
+backoff base 5 s):
+
+|                                 | Attempt 1                                                                       | Attempt 2                                          |
+| ------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------- |
+| starts                          | 2.61 s                                                                          | ~37 s (lease 30 s + jitter ~4.4 s; window 30–35 s) |
+| `charge booking`                | 10.0 s, **error**, `payment.outcome=unknown`                                    | 28.4 ms, `payment.attempt=2`, `succeeded`          |
+| payments client `POST /charges` | 10.0 s, **error** (request cancelled), no status code                           | 2.4 ms, 200                                        |
+| paymock server `POST /charges`  | **10 s, 200, no error**, `charge.lost_response=true`, `charge.status=succeeded` | `charge.replay=true`                               |
+| paymock `charge_id`             | `62abed4b…`                                                                     | `62abed4b…` (same: money moved once)               |
+
+The server span is 10 s, not 30 s: the client hung up, `r.Context()` was
+cancelled, and the handler's sleep returned. Its 200 is the default status
+of a handler that never wrote; the client never received it.
+
+The same run with payments not yet restarted (no `otelhttp` transport):
+attempt 1 10.0 s error, attempt 2 at +33.7 s, 27.9 ms; no `POST /charges`
+spans under `charge booking`.
+
+**Observations:**
+
+- **End-to-end latency is set by poll intervals,** not by any service: three
+  polls (relay, worker, relay) ≈ 1.1 s of a 1.24 s booking.
+- **Retries line up in one trace.** The booking row's context doesn't change,
+  so every `charge booking` attempt is a sibling under the API span.
+- **The trace found a bug no log or test showed:** every restart of a
+  consumer paused it for ~45 s, because `Close` hung with
+  `BlockRebalanceOnPoll` and the process was killed before it left the group.
+  Every rolling deploy would have paused consumption.
+- **Client and server disagree on a lost response**, and both are right from
+  their side: error vs 200. Only the trace shows both.
+- **Every span except a few has `Warnings (1)` in Jaeger.** Not yet read.
+
+**Open:**
+
+- Step 7, choice B: the consumer re-parents `bookings.trace_context` to its
+  own span, so `charge booking` sits under `process booking.created`
+- Worker trace tests (`processOne` runs in goroutines; wait for the spans)
+- `LISTEN/NOTIFY` for the relay and worker; measure booking → confirmed again
+- An OpenTelemetry Collector between the services and Jaeger (buffering,
+  tail sampling)
+- One Setup-failure policy for every binary (the API exits, the rest don't)
+- Tracing in the notifier
+- paymock: mark the server span when the caller is gone (untested)
+- Read the `Warnings (1)` text
+- Verify the idle-reconnect explanation for the 338 ms publish

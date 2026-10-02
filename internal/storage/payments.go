@@ -25,6 +25,7 @@ type DuePayment struct {
 	Currency     string
 	PendingSince time.Time // updated_at: when it entered payment_pending; drives escalation
 	Attempts     int
+	TraceContext map[string]string
 }
 
 // Payment is one payment outcome to record. Timeouts are not recorded: an
@@ -62,7 +63,7 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 			) * interval '1 second'
 		FROM due
 		WHERE b.booking_id = due.booking_id
-		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.total_minor, b.currency, b.updated_at, b.payment_attempts
+		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.total_minor, b.currency, b.updated_at, b.payment_attempts, b.trace_context
 	`, limit, int(lease.Seconds()), int(backoffBase.Seconds()), int(maxBackoff.Seconds()))
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -77,7 +78,7 @@ func (s *Store) ClaimDuePayments(ctx context.Context, limit int, lease time.Dura
 	var due []DuePayment
 	for rows.Next() {
 		var d DuePayment
-		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.CustomerID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince, &d.Attempts); err != nil {
+		if err := rows.Scan(&d.BookingID, &d.UnitID, &d.CustomerID, &d.Qty, &d.TotalMinor, &d.Currency, &d.PendingSince, &d.Attempts, &d.TraceContext); err != nil {
 			return nil, fmt.Errorf("scan due payment: %w", err)
 		}
 		due = append(due, d)

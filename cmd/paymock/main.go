@@ -31,6 +31,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type chargeRequest struct {
@@ -82,6 +86,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := telemetry.Setup(ctx, "paymock", logger)
+	if err != nil {
+		logger.Error("telemetry setup failed; running without tracing", "error", err)
+		shutdownTracing = func(context.Context) error { return nil }
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			logger.Error("flush traces", "error", err)
+		}
+	}()
+
 	store := newChargeStore()
 	mux := http.NewServeMux()
 
@@ -89,7 +106,7 @@ func main() {
 		writeJSON(w, http.StatusOK, store.snapshot())
 	})
 
-	mux.HandleFunc("POST /charges", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /charges", otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req chargeRequest
 		dec := json.NewDecoder(r.Body)
@@ -147,6 +164,13 @@ func main() {
 			return rec
 		})
 
+		trace.SpanFromContext(r.Context()).SetAttributes(
+			attribute.String("booking.id", req.BookingID.String()),
+			attribute.String("charge.status", result.PaymentStatus),
+			attribute.Bool("charge.replay", existed),
+			attribute.Bool("charge.lost_response", lostResponse),
+		)
+
 		logger.Info("charge",
 			"key", key, "booking_id", req.BookingID, "charge_id", result.ChargeID,
 			"status", result.PaymentStatus, "replay", existed, "lost_response", lostResponse)
@@ -164,7 +188,7 @@ func main() {
 			w.Header().Set("Idempotent-Replay", "true")
 		}
 		writeJSON(w, http.StatusOK, result.chargeResponse)
-	})
+	}), "POST /charges"))
 
 	srv := &http.Server{
 		Addr:        ":" + k.port,

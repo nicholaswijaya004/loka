@@ -27,13 +27,15 @@ type Booking struct {
 	CancelledAt   *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	TraceContext  map[string]string
 }
 
 type ExpiredBooking struct {
-	BookingID  uuid.UUID
-	UnitID     uuid.UUID
-	CustomerID uuid.UUID
-	Qty        int
+	BookingID    uuid.UUID
+	UnitID       uuid.UUID
+	CustomerID   uuid.UUID
+	Qty          int
+	TraceContext map[string]string
 }
 
 var failAfterDecrement = func() float64 {
@@ -51,11 +53,11 @@ func (s *Store) InsertBooking(ctx context.Context, b *Booking) error {
 
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO bookings (unit_id, customer_id, qty, visit_date_time,
-		                      total_minor, currency, booking_status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		                      total_minor, currency, booking_status, trace_context)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING booking_id, created_at, updated_at
 	`, b.UnitID, b.CustomerID, b.Qty, b.VisitDateTime,
-		b.TotalMinor, b.Currency, b.BookingStatus,
+		b.TotalMinor, b.Currency, b.BookingStatus, b.TraceContext,
 	).Scan(&b.BookingID, &b.CreatedAt, &b.UpdatedAt)
 	if isSerializationFailure(err) {
 		return ErrSerializationFailure
@@ -71,12 +73,12 @@ func (s *Store) GetBooking(ctx context.Context, id uuid.UUID) (*Booking, error) 
 	err := s.db.QueryRow(ctx, `
 		SELECT booking_id, unit_id, customer_id, qty, visit_date_time,
 			   total_minor, currency, booking_status, failure_reason,
-			   confirmed_at, cancelled_at, created_at, updated_at
+			   confirmed_at, cancelled_at, created_at, updated_at, trace_context
 		FROM bookings
 		WHERE booking_id = $1
 	`, id).Scan(&b.BookingID, &b.UnitID, &b.CustomerID, &b.Qty, &b.VisitDateTime,
 		&b.TotalMinor, &b.Currency, &b.BookingStatus, &b.FailureReason,
-		&b.ConfirmedAt, &b.CancelledAt, &b.CreatedAt, &b.UpdatedAt,
+		&b.ConfirmedAt, &b.CancelledAt, &b.CreatedAt, &b.UpdatedAt, &b.TraceContext,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrBookingNotFound
@@ -142,7 +144,7 @@ func (s *Store) ExpirePendingBookings(ctx context.Context, olderThan time.Durati
 		FROM expired
 		WHERE b.booking_id = expired.booking_id
 		  AND b.booking_status = 'pending'
-		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty
+		RETURNING b.booking_id, b.unit_id, b.customer_id, b.qty, b.trace_context
 	`, int(olderThan.Seconds()), limit)
 	if err != nil {
 		return nil, fmt.Errorf("expire pending bookings: %w", err)
@@ -152,7 +154,7 @@ func (s *Store) ExpirePendingBookings(ctx context.Context, olderThan time.Durati
 	var expired []ExpiredBooking
 	for rows.Next() {
 		var e ExpiredBooking
-		if err := rows.Scan(&e.BookingID, &e.UnitID, &e.CustomerID, &e.Qty); err != nil {
+		if err := rows.Scan(&e.BookingID, &e.UnitID, &e.CustomerID, &e.Qty, &e.TraceContext); err != nil {
 			return nil, fmt.Errorf("scan expired booking: %w", err)
 		}
 		expired = append(expired, e)

@@ -10,11 +10,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/nicholaswijaya004/loka/internal/api"
 	"github.com/nicholaswijaya004/loka/internal/booking"
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
 )
 
 type storeAdapter struct {
@@ -39,6 +42,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := telemetry.Setup(ctx, "api", logger)
+	if err != nil {
+		logger.Error("telemetry setup failed", "error", err)
+		os.Exit(1)
+	}
+
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err)
+		}
+	}()
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://loka:loka@localhost:5432/loka?sslmode=disable"
@@ -50,6 +67,7 @@ func main() {
 		os.Exit(1)
 	}
 	cfg.MaxConns = 50
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -113,8 +131,8 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("POST /bookings", h.CreateBooking)
-	mux.HandleFunc("GET /bookings/{id}", h.GetBooking)
+	mux.Handle("POST /bookings", otelhttp.NewHandler(http.HandlerFunc(h.CreateBooking), "POST /bookings"))
+	mux.Handle("GET /bookings/{id}", otelhttp.NewHandler(http.HandlerFunc(h.GetBooking), "GET /bookings/{id}"))
 
 	srv := &http.Server{
 		Addr:         ":8080",

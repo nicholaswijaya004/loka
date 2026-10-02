@@ -11,8 +11,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
 )
 
 const (
@@ -55,6 +60,8 @@ func NewExpirer(store *storage.Store, logger *slog.Logger, cfg ExpirerConfig) *E
 	return &Expirer{store: store, logger: logger, cfg: cfg}
 }
 
+var tracer = otel.Tracer("github.com/nicholaswijaya004/loka/internal/booking")
+
 // RunOnce expires one batch and returns how many bookings it expired. The
 // transitions, the seat releases and the events commit together or not at
 // all: a transition without its release would leak seats, and a release
@@ -67,23 +74,46 @@ func (e *Expirer) RunOnce(ctx context.Context) (int, error) {
 	}
 
 	var expired []storage.ExpiredBooking
+	var spans []trace.Span
 	err := e.store.WithTx(ctx, func(tx *storage.Store) error {
 		var err error
 		expired, err = tx.ExpirePendingBookings(ctx, e.cfg.After, e.cfg.BatchSize)
 		if err != nil || len(expired) == 0 {
 			return err
 		}
+
+		// One span per booking, in that booking's own trace, so the trace of
+		// an abandoned booking ends with its expiry. The spans are ended after
+		// the transaction, so none of them claims an expiry that rolled back.
+		bookingCtxs := make([]context.Context, len(expired))
+		for i, b := range expired {
+			var span trace.Span
+			bookingCtxs[i], span = tracer.Start(telemetry.Extract(ctx, b.TraceContext), "expire booking",
+				trace.WithAttributes(
+					attribute.String("booking.id", b.BookingID.String()),
+					attribute.Int("expire.batch_size", len(expired)),
+				))
+			spans = append(spans, span)
+		}
+
 		if err := releaseSeats(ctx, tx, expired); err != nil {
 			return err
 		}
 		cancelledAt := time.Now().UTC()
-		for _, b := range expired {
-			if err := insertCancelledEvent(ctx, tx, b, cancelledAt); err != nil {
+		for i, b := range expired {
+			if err := insertCancelledEvent(bookingCtxs[i], tx, b, cancelledAt); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	for _, span := range spans {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "expiry rolled back")
+		}
+		span.End()
+	}
 	if err != nil {
 		return 0, fmt.Errorf("expire pending bookings: %w", err)
 	}
@@ -131,6 +161,7 @@ func insertCancelledEvent(ctx context.Context, tx *storage.Store, b storage.Expi
 		AggregateID:   b.BookingID,
 		EventType:     EventBookingCancelled,
 		Payload:       payload,
+		TraceContext:  telemetry.Inject(ctx), // ← is this line there?
 	})
 }
 

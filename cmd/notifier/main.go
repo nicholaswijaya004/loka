@@ -68,7 +68,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("kafka client: %w", err)
 	}
-	defer client.Close()
+	defer client.CloseAllowingRebalance()
 
 	c := consumer.New(notifier.ConsumerName, storage.NewStore(pool), notifier.New(logger), logger)
 

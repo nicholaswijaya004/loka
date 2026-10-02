@@ -10,10 +10,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/nicholaswijaya004/loka/internal/booking"
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
 )
+
+var tracer = otel.Tracer("github.com/nicholaswijaya004/loka/internal/payments")
 
 const (
 	aggregateBooking      = "booking"
@@ -62,7 +69,18 @@ func NewWorker(store *storage.Store, provider Provider, logger *slog.Logger, cfg
 // processOne charges one booking and acts on the answer. It never cancels a
 // booking whose outcome is unknown: those stay payment_pending, and the lease
 // makes a later poll try again with the same idempotency key.
+//
+// Each attempt is one span, parented by the request that created the booking,
+// so a booking's retries show up side by side in its trace. The span is an
+// error only when the system failed to get or record an answer; a declined
+// card is a correct answer, not an error.
 func (w *Worker) processOne(ctx context.Context, d storage.DuePayment) {
+	ctx, span := tracer.Start(telemetry.Extract(ctx, d.TraceContext), "charge booking",
+		trace.WithAttributes(
+			attribute.String("booking.id", d.BookingID.String()),
+			attribute.Int("payment.attempt", d.Attempts),
+		))
+	defer span.End()
 	log := w.logger.With("booking_id", d.BookingID)
 
 	res, err := w.provider.Charge(ctx, ChargeRequest{
@@ -73,34 +91,47 @@ func (w *Worker) processOne(ctx context.Context, d storage.DuePayment) {
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return // shutting down; the lease hands this booking to the next run
+			// Shutting down; the lease hands this booking to the next run.
+			span.SetAttributes(attribute.Bool("interrupted", true))
+			return
 		}
+		span.RecordError(err)
 		waiting := time.Since(d.PendingSince)
 		switch {
 		case IsPermanent(err):
 			// Retrying can't help. Escalate now; never cancel.
+			span.SetAttributes(attribute.Bool("escalate", true))
+			span.SetStatus(codes.Error, "permanent provider error")
 			log.Error("payment needs review: escalate",
 				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		case waiting > w.cfg.EscalateAfter:
+			span.SetAttributes(attribute.Bool("escalate", true))
+			span.SetStatus(codes.Error, "payment stuck")
 			log.Error("payment stuck: escalate",
 				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		default:
+			span.SetAttributes(attribute.String("payment.outcome", "unknown"))
+			span.SetStatus(codes.Error, "no answer from provider")
 			log.Warn("charge got no answer, will retry",
 				"attempts", d.Attempts, "waiting", waiting, "error", err)
 		}
 		return
 	}
 
+	span.SetAttributes(attribute.String("payment.outcome", string(res.Outcome)))
 	err = w.applyOutcome(ctx, d, res)
 	switch {
 	case err == nil:
 		log.Info("payment outcome recorded", "outcome", res.Outcome, "charge_id", res.ChargeID)
 	case errors.Is(err, storage.ErrStatusConflict):
 		// Another worker recorded this outcome first. Correct, not a failure.
+		span.SetAttributes(attribute.Bool("duplicate", true))
 		log.Info("payment outcome already recorded")
 	default:
 		// The charge is known but recording it failed. The lease brings it
 		// back, the same key replays the same result, and we try again.
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "record outcome failed")
 		log.Error("record payment outcome", "outcome", res.Outcome, "error", err)
 	}
 }
@@ -200,6 +231,7 @@ func insertEvent(ctx context.Context, tx *storage.Store, bookingID uuid.UUID, ev
 		AggregateID:   bookingID,
 		EventType:     eventType,
 		Payload:       b,
+		TraceContext:  telemetry.Inject(ctx), // the charge span, so the event continues this trace
 	})
 }
 

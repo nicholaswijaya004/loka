@@ -12,6 +12,7 @@ type Event struct {
 	Type    string
 	Key     string
 	Payload []byte
+	Headers map[string]string
 }
 
 func header(r *kgo.Record, key string) (string, bool) {
@@ -42,10 +43,16 @@ func parseEvent(r *kgo.Record) (Event, error) {
 			ErrPoisonMessage, r.Partition, r.Offset)
 	}
 
+	headers := make(map[string]string, len(r.Headers))
+	for _, h := range r.Headers {
+		headers[h.Key] = string(h.Value)
+	}
+
 	return Event{
 		ID:      id,
 		Type:    eventType,
 		Key:     string(r.Key),
 		Payload: r.Value,
+		Headers: headers,
 	}, nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
 )
 
 const (
@@ -115,6 +116,11 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 }
 
 func (s *Service) insertBookingWithEvent(ctx context.Context, tx Store, b *storage.Booking) error {
+	// The request's trace travels with both rows: the relay reads it from the
+	// outbox row (Kafka headers), the worker and expirer from the booking row.
+	headers := telemetry.Inject(ctx)
+	b.TraceContext = headers
+
 	if err := tx.InsertBooking(ctx, b); err != nil {
 		return err
 	}
@@ -140,6 +146,7 @@ func (s *Service) insertBookingWithEvent(ctx context.Context, tx Store, b *stora
 		AggregateID:   b.BookingID,
 		EventType:     eventBookingCreated,
 		Payload:       payload,
+		TraceContext:  headers,
 	})
 }
 
