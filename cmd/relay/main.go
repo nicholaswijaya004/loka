@@ -22,6 +22,7 @@ import (
 
 	"github.com/nicholaswijaya004/loka/internal/relay"
 	"github.com/nicholaswijaya004/loka/internal/storage"
+	"github.com/nicholaswijaya004/loka/internal/telemetry"
 )
 
 const (
@@ -41,6 +42,20 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := telemetry.Setup(ctx, "relay", logger)
+	if err != nil {
+		logger.Error("telemetry setup failed; running without tracing", "error", err)
+		shutdownTracing = func(context.Context) error { return nil } // a no-op, so the defer is safe
+	}
+
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err)
+		}
+	}()
 
 	dsn := envOr("DATABASE_URL", "postgres://loka:loka@localhost:5432/loka?sslmode=disable")
 	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")

@@ -1536,3 +1536,142 @@ why 6.8% were lost, not 10%.
 - An expiry-rate metric and alert
 - The 1k chaos test as a nightly CI job
 - Customer cancel during `payment_pending`; the provider lookup endpoint
+
+## Day 23
+
+### What I built
+
+- **Tracing across all four services:** the API, the relay, payments and
+  paymock, viewed in Jaeger. One booking is one trace, from `POST /bookings`
+  to `booking.confirmed`, including every retry.
+- **Trace context that travels with the data:** in a JSONB column on the
+  outbox and booking rows, in Kafka headers, and in the HTTP `traceparent`
+  header to the provider.
+- **Spans with meaning:** a charge attempt, a publish, a process, an expiry,
+  each with the booking id, and an error status only when the system failed.
+- **A fix for a consumer bug** that I found by looking at a trace.
+
+### Prediction before measuring
+
+[fill in honestly, or write "not written before the runs": the end-to-end
+time of one booking and where it goes; how long paymock's span would be when
+the caller times out at 10 s; whether paymock's span would show an error;
+when the retry would start]
+
+### What happened
+
+- **A warm booking took 1.24 s from request to confirmation,** and about
+  90% of that was waiting for polls: the relay, then the worker, then the
+  relay again. The actual work after the API was about 90 ms.
+- **A trace showed a gap of 10 s, then 34 s, then 28 s** before payments
+  processed a booking after a restart. The timings matched "old process
+  killed + 45 s" to within 0.3 s. The cause: `client.Close()` hangs with
+  `BlockRebalanceOnPoll`, my second Ctrl-C killed the process, and it never
+  left the consumer group. After `CloseAllowingRebalance`, the group is empty
+  right after shutdown and a restart charges a booking within 6 s.
+- **In the lost-response run,** attempt 1 failed after 10 s with no answer,
+  attempt 2 succeeded 34 s later in 28 ms, and paymock logged the same
+  `charge_id` both times. Paymock's own span said **200, no error, lost
+  response**, while payments' client span said **error**.
+- **The expirer tests failed on my first try:** the `booking.cancelled` rows
+  had no trace context. The spans were right, the events weren't.
+
+### What I understand now
+
+**Context travels with the data.** Across an HTTP call the trace goes in a
+header automatically. Across an async hop nothing carries it unless I store
+it next to the data: in the outbox row for the relay, in the booking row for
+the worker and the expirer, in the Kafka headers for the consumer. Whatever
+reads the data reads the parent with it.
+
+**Inject the span that did the work.** The relay puts **its own** span into
+the Kafka headers, not the stored one, so the consumer appears under the
+publish. The worker's outcome event and each expiry event carry their own
+span, so the trace keeps going after them. One shared `ctx` for a whole batch
+would put every booking's event in the wrong trace.
+
+**A span's error means the system failed, not that the answer was no.** A
+declined card is a correct answer: no error. No answer, a permanent error, or
+an outcome that couldn't be recorded: error. Otherwise every decline would
+look like an outage on a dashboard.
+
+**End a span only when its outcome is known.** The expirer's spans start
+inside the transaction and end after it, so a rollback is an error and never
+a fake "expired".
+
+**Telemetry is best effort.** With Jaeger down, bookings still returned 201
+and the spans were dropped. Tracing must never be the reason a request fails.
+In production a local Collector would buffer instead.
+
+**Latency in an async pipeline is mostly waiting.** A hop through Kafka costs
+about 5 ms, because the consumer is already waiting on the partition. A hop
+through a polled table costs up to the poll interval. Three polled hops made
+up 90% of a booking. `LISTEN/NOTIFY` would remove most of that.
+
+**`BlockRebalanceOnPoll` changes how a consumer must close.** Leaving the
+group needs a rebalance, and the option blocks rebalances until
+`AllowRebalance`. A shutdown during a poll never calls it, so `Close` hangs.
+`CloseAllowingRebalance` is the documented shortcut. A consumer that doesn't
+leave holds its partitions for a full session timeout (45 s).
+
+**A server's status code is what it would have sent, not what arrived.**
+Paymock's handler returned without writing, and `otelhttp` recorded the
+default 200. The client had already hung up. From the provider's telemetry
+alone, the lost response looked like a success; from mine alone, like an
+outage.
+
+**The trace proves idempotency.** Two attempts, two calls, one `charge_id`:
+the second call was a replay that took 2.4 ms. Money moved once.
+
+**A broken hop shows up as orphan root traces downstream.** Before I restarted
+payments, paymock's spans had no parent. Lots of root traces in a service that
+is only ever called by others means a hop lost its context.
+
+**A package-level tracer binds to the first global provider.** In tests, the
+recording provider has to be installed once per test binary (`sync.Once`), or
+later tests never see a span.
+
+### Things that went wrong
+
+- First `relay.go` draft called `Publish` twice and ended the span before the
+  real publish.
+- Added `trace_context` to the outbox `SELECT` but not to the `Scan`.
+- Copy-pasted `"api"` as the relay's service name.
+- A logging-only Setup fallback left `shutdown` nil, which would have
+  panicked at the deferred flush.
+- `telemetry.go` first draft: `AlwaysSample()` without the package prefix, a
+  variable called `resource` shadowing the package, and `Inject` returning
+  `{}` instead of `nil`.
+- Forgot to click Find Traces again and thought Jaeger had no new traces.
+- The expirer's `booking.cancelled` events had no trace context at first; the
+  new tests caught it.
+- Ran the lost-response experiment without restarting payments, so the
+  Step 6 spans were missing.
+- [fill in: predictions, if skipped again]
+
+### Questions I should be able to answer
+
+- What is in a `traceparent`, and what does each part do?
+- How does the trace cross the outbox, Kafka and the booking row? Why not
+  just pass `ctx`?
+- Why does the relay inject its own span into Kafka, not the stored one?
+- Choice A vs choice B for the worker's parent: what does each show, and
+  which removes a dependency on the booking row?
+- Head sampling vs tail sampling: what can each one keep?
+- What happens to bookings when the tracing backend is down? Why?
+- Why is a declined charge not an error span?
+- Why does the expirer end its spans after the transaction?
+- Where did a warm booking's 1.24 s go? What would you change first?
+- Why did a restarted consumer wait 45 s, and how did one line fix it?
+- In the lost-response trace, why is paymock's span 10 s and 200, while the
+  client's is an error?
+- How does the trace prove a retried charge didn't charge twice?
+
+### Still open
+
+- Step 7: the consumer re-parents the booking's trace (choice B)
+- Worker trace tests
+- `LISTEN/NOTIFY` instead of polling, then measure again
+- An OpenTelemetry Collector; a sampling ratio for production
+- One Setup-failure policy for every binary; tracing in the notifier
+- Read Jaeger's `Warnings (1)`; verify the idle-reconnect explanation

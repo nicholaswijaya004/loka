@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // HTTPProvider is the Provider that talks to a payment provider over HTTP
@@ -26,7 +27,16 @@ var _ Provider = (*HTTPProvider)(nil)
 // always gives up on its call before another worker can claim the booking.
 func NewHTTPProvider(baseURL string, timeout time.Duration) *HTTPProvider {
 	return &HTTPProvider{
-		client:  &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			// A client span per call, and the traceparent header on the request,
+			// so the provider's own span joins the charge's trace.
+			Transport: otelhttp.NewTransport(http.DefaultTransport,
+				otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+					return r.Method + " " + r.URL.Path
+				}),
+			),
+		},
 		baseURL: strings.TrimRight(baseURL, "/"),
 	}
 }

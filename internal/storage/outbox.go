@@ -19,15 +19,16 @@ type Outbox struct {
 	Error         *string
 	CreatedAt     time.Time
 	PublishedAt   *time.Time
+	TraceContext  map[string]string
 }
 
 func (s *Store) InsertOutboxEvent(ctx context.Context, o *Outbox) error {
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, 
-									payload)
-		VALUES ($1, $2, $3, $4)
+									payload, trace_context)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, created_at
-		`, o.AggregateType, o.AggregateID, o.EventType, o.Payload,
+		`, o.AggregateType, o.AggregateID, o.EventType, o.Payload, o.TraceContext,
 	).Scan(&o.ID, &o.CreatedAt)
 	if isSerializationFailure(err) {
 		return ErrSerializationFailure
@@ -40,7 +41,7 @@ func (s *Store) InsertOutboxEvent(ctx context.Context, o *Outbox) error {
 
 func (s *Store) FetchUnpublishedOutboxEvents(ctx context.Context, limit int) ([]Outbox, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, aggregate_type, aggregate_id, event_type, payload,
+		SELECT id, aggregate_type, aggregate_id, event_type, payload, trace_context,
 		       attempt_number, error, created_at, published_at
 		FROM outbox_events
 		WHERE published_at IS NULL
@@ -56,7 +57,7 @@ func (s *Store) FetchUnpublishedOutboxEvents(ctx context.Context, limit int) ([]
 	var events []Outbox
 	for rows.Next() {
 		var e Outbox
-		if err := rows.Scan(&e.ID, &e.AggregateType, &e.AggregateID, &e.EventType, &e.Payload,
+		if err := rows.Scan(&e.ID, &e.AggregateType, &e.AggregateID, &e.EventType, &e.Payload, &e.TraceContext,
 			&e.AttemptNumber, &e.Error, &e.CreatedAt, &e.PublishedAt); err != nil {
 			return nil, fmt.Errorf("scan outbox event: %w", err)
 		}
