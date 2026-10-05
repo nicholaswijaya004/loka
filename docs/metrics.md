@@ -1385,3 +1385,160 @@ spans under `charge booking`.
 - paymock: mark the server span when the caller is gone (untested)
 - Read the `Warnings (1)` text
 - Verify the idle-reconnect explanation for the 338 ms publish
+
+## Day 24
+
+**Goal:** Under a steady load spread over many units, find what dominates the
+slowest 1% of `POST /bookings` from the traces and from Postgres, fix one
+thing, and compare p99 before and after over several runs.
+
+**Settings:**
+
+| Setting     | Value                                                                                                                                                          | Why                                                                                     |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| load        | k6 `constant-arrival-rate`: `POST /bookings` 50/s round-robin over 1,000 units (100 seats each), `GET /bookings/{id}` 25/s over 200 bookings made in `setup()` | open model, so a slow server can't lower the load; no row contention; nothing sells out |
+| run         | full reset + seed, 15 s warm-up (discarded), `CHECKPOINT` + `ANALYZE` + `pg_stat_statements_reset()`, 2 min measured                                           | the same starting state every run; no checkpoint inside the measured window             |
+| VUs         | pre-allocated 200 POST / 100 GET (max 500 / 200)                                                                                                               | with 50 / 20, k6 dropped requests during stalls instead of measuring them               |
+| valid run   | 0 failed, 0 dropped                                                                                                                                            | decided before the runs                                                                 |
+| tracing     | `ParentBased(AlwaysSample())` on both sides                                                                                                                    | same overhead before and after                                                          |
+| paymock     | `LATENCY_MS=100`                                                                                                                                               | same background pipeline load every run                                                 |
+| Postgres    | `shared_preload_libraries=pg_stat_statements`, `track_io_timing=on`                                                                                            | per-statement times                                                                     |
+| machine     | MacBook Pro 16" 2019, Intel i9 8-core, 16 GB; Docker Desktop 8 CPUs, 2 GB memory, 1 GB swap                                                                    | numbers are this machine's, not Loka's in general                                       |
+| improvement | only if the worst after-run beats the best before-run                                                                                                          | p99 is noisy; a median alone can't show a change                                        |
+
+**Built:**
+
+- **Load tooling:** `scripts/k6/load.js` (steady spread load, POST and GET
+  reported separately, compact summary + JSON), `scripts/seed-load.sql`
+  (1,000 units, 100 customers, deterministic IDs, `pg_stat_statements`),
+  `scripts/loadrun.sh` (one run from an identical start; fails fast on a
+  missing seed, compose change or binary; `MONITOR=1` adds `docker stats` and
+  an in-VM `SELECT 1` probe for diagnosis), `scripts/traces.sh` (Jaeger v3
+  API as text: slow traces per second, pick by duration, one trace's spans
+  and the gap).
+- **API:** `GET /bookings/{id}` reads through its own pool (`MaxConns` 10,
+  `application_name` `loka-api-read`); the write pool is `loka-api`.
+  `booking.WithReader` option; an idempotent replay stays on the write store.
+
+**Tests added:**
+
+| Package               | Proves                                                                                                                                    | Result           |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| booking (integration) | with every write connection held, `Get` with a reader is served from the read pool; control: without a reader it waits until its deadline | ✓ 1 (2 subtests) |
+| booking (unit)        | `Get` uses the store by default and the reader when one is set; a replay never uses the reader                                            | ✓ 3              |
+
+All with `-race`. Checked against broken code: `Get` ignoring the reader
+(integration: deadline exceeded after 2 s; unit fails), replay using the
+reader (unit fails).
+
+**Baseline (Block 1), 3 valid runs:**
+
+| Run      | POST p50 | POST p95 | POST p99  | POST max | GET p99 | Note                                                |
+| -------- | -------- | -------- | --------- | -------- | ------- | --------------------------------------------------- |
+| before-1 | 58.6     | 238.0    | 1,071.2   | 1,646.7  | 816.8   | first run of a sequence, binaries built just before |
+| before-2 | 29.6     | 48.3     | 79.3      | 199.7    | 11.2    | 50 / 20 VUs, 0 dropped                              |
+| before-3 | 29.0     | 47.2     | 280.8     | 961.1    | 145.4   | 50 / 20 VUs, 0 dropped                              |
+| median   | 29.6     | 48.3     | **280.8** |          |         | p99 range **79.3–1,071.2**                          |
+
+Excluded (dropped requests, 50 / 20 VUs): p99 838.6 (13 dropped) and 511.4
+(9 dropped). All times in ms.
+
+**Where the slowest 1% goes (Block 2, before-1's stack):**
+
+| Question                  | Answer                   | Evidence                                                                                                              |
+| ------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| When are POSTs slow?      | in bursts                | 78 POSTs ≥ 1 s, all in 4 episodes (09:57:39–40, 09:58:00–01, 09:58:34–35, 09:58:41)                                   |
+| Which statement?          | whichever was in flight  | slow traces: store-response `UPDATE` 1,022 ms, booking `INSERT` 1,012 ms, **`BEGIN` 1,011 ms**, `pool.acquire` 902 ms |
+| Inside Postgres?          | no                       | largest `max_ms` of any statement 221; `UPDATE idempotency_keys` max 94.7                                             |
+| N+1 or missing index?     | no                       | the slow step differs per trace; every statement is fast in Postgres                                                  |
+| Checkpoints?              | no                       | 09:57:08 (forced, before the run) and 10:02:08 (after it)                                                             |
+| Typical request (58.5 ms) | 8 round trips × 4–9 ms   | `BEGIN` 6.4 ms in the span vs 0.004 ms in Postgres                                                                    |
+| A slow GET                | waiting for a connection | `pool.acquire` 881.6 ms, then `SELECT` 22 ms                                                                          |
+
+`pg_stat_statements` doesn't count commit work: `commit` shows 20,048 calls
+at 0.006 ms mean.
+
+**Diagnostic run** (`MONITOR=1`, not a measurement; p50 84.5 ms from the
+monitors' own overhead):
+
+| API stall episode | Traces ≥ 1 s | In-VM `SELECT 1` probe |
+| ----------------- | ------------ | ---------------------- |
+| 10:35:20          | 6            | nothing > 100 ms       |
+| 10:35:38–39       | 23           | 872 ms                 |
+| 10:35:48–50       | 21           | 1,015 ms               |
+| 10:36:34–35       | 31           | 119 ms                 |
+| 10:37:03–04       | 41           | nothing > 100 ms       |
+
+`docker stats` (every ~4 s): Kafka 75–421% CPU, Postgres 45–229%, Jaeger
+< 16%. Peak memory Kafka 507 MiB, Postgres 202 MiB, Jaeger 199 MiB of the
+VM's 1.94 GiB. Kafka's peaks don't line up with the stalls.
+
+**Fix (Block 3): separate read pool, alternated runs:**
+
+| Order | Run      | POST p50 | POST p95 | POST p99 | GET p95 | GET p99 |
+| ----- | -------- | -------- | -------- | -------- | ------- | ------- |
+| 1     | after-1  | 42.4     | 157.6    | 1,086.9  | 19.4    | 796.0   |
+| 2     | before-7 | 43.8     | 196.6    | 1,127.7  | 36.0    | 842.6   |
+| 3     | after-2  | 30.9     | 49.8     | 80.6     | 6.5     | 10.4    |
+| 4     | before-8 | 31.4     | 52.6     | 94.5     | 7.1     | 14.5    |
+| 5     | after-3  | 62.9     | 930.4    | 1,622.3  | 225.8   | 925.5   |
+| 6     | before-9 | 45.9     | 131.5    | 1,000.8  | 19.0    | 738.5   |
+
+Each sequence started with a discarded burn-in run. Not alternated (same
+session, earlier): before-4..6 GET p99 20.2 / 685.2 / 772.3, POST p99
+125.7 / 936.2 / 953.9.
+
+| Metric   | Before 7–9: median (range) | After 1–3: median (range) | Verdict                           |
+| -------- | -------------------------- | ------------------------- | --------------------------------- |
+| GET p99  | 738.5 (14.5–842.6)         | 796.0 (10.4–925.5)        | overlap: **no improvement shown** |
+| POST p99 | 1,000.8 (94.5–1,127.7)     | 1,086.9 (80.6–1,622.3)    | overlap: no change shown          |
+| POST p50 | 43.8 (31.4–45.9)           | 42.4 (30.9–62.9)          | overlap                           |
+
+**k6 VUs vs a 2 s Postgres freeze** (my Linux container, `docker pause`):
+
+| Pre-allocated VUs | POST p95 | POST p99 | Dropped |
+| ----------------- | -------- | -------- | ------- |
+| 50 / 20           | 384 ms   | 2,089 ms | 47      |
+| 200 / 100         | 963 ms   | 2,319 ms | 0       |
+
+**Observations:**
+
+- **The slowest 1% is not a query problem.** 1–1.7 s stalls, several per
+  2 minutes, freeze whatever each request is doing, even a `BEGIN`. No
+  statement is slow inside Postgres, and no checkpoint runs. Not N+1, not a
+  missing index.
+- **p99 measures whether a stall happened.** Across the baseline runs p50
+  ranged 29–59 ms, p95 47–238 ms and p99 79–1,071 ms on identical code. At
+  75 requests/s a 1 s stall alone fills the ~60 requests that decide p99.
+- **Neighbouring runs resemble each other, whichever binary runs.** The
+  stalls come and go over ~10-minute periods. Without alternating, the fix
+  would have looked better or worse depending on which period it landed in.
+- **The read pool didn't change GET p99.** GETs on their own pool still
+  waited ~0.8–0.9 s in stall runs, so the freeze reaches reads directly.
+  Block 2's "GET p99 is pool wait" came from one trace and was too broad.
+  Not verified with a slow GET trace from an after run.
+- **The in-VM probe froze in 2 of 5 episodes.** Some stalls are inside the
+  VM; the others are outside what a local `SELECT 1` sees (the Mac ↔ VM
+  path, the Mac side, or the write path).
+- **Too few pre-allocated VUs hide the tail.** k6 dropped the stall's
+  requests instead of timing them: p95 384 vs 963 ms for the same freeze.
+- **First runs after heavy CPU work were among the slowest** (p50 38–69 ms,
+  after building binaries or `make test-integration`), but after-3, in the
+  middle of a sequence, reached 62.9 ms too. A weak pattern, cause unknown.
+- **A typical POST is 8 round trips** at ~4–9 ms each through Docker
+  Desktop; my Linux container: 0.7 ms per `BEGIN`, POST p99 17.9 ms in one
+  check run (not comparable).
+
+**Open:**
+
+- A slow GET trace from an after run: waiting in `pool.acquire` or `SELECT`?
+- Measure the read pool under the hot-unit contention load, where row locks
+  really do fill the write pool
+- Locate the stalls outside the VM: a host-side probe, `track_wal_io_timing`
+- Why Kafka uses ~3 of 8 VM CPUs at ~75 messages/s
+- Store the idempotent response inside the booking transaction: 8 → 7 round
+  trips, 3 → 2 commits, and no booking committed with its key still
+  `in_progress` after a crash
+- First-run drift: a first run with no heavy work before it; `pmset -g therm`
+- VM swap counters (`vmmon.txt`) not checked
+- The same load on Linux / native Docker, to separate the machine from Loka
