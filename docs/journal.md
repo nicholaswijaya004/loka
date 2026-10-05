@@ -1675,3 +1675,133 @@ later tests never see a span.
 - An OpenTelemetry Collector; a sampling ratio for production
 - One Setup-failure policy for every binary; tracing in the notifier
 - Read Jaeger's `Warnings (1)`; verify the idle-reconnect explanation
+
+## Day 24
+
+### What I built
+
+- **A steady-load test** for the normal path: 50 bookings/s spread over
+  1,000 units plus 25 reads/s, an open-model k6 script, and a run script
+  that starts every run from the same state (reset, seed, warm-up,
+  checkpoint) and refuses to start when something is missing.
+- **Text tools for Jaeger**: which seconds had slow requests, and one
+  trace's spans with the gap.
+- **A separate connection pool for `GET /bookings/{id}`**, so reads can't
+  queue behind writes. It didn't move p99 on my machine (below).
+- I skimmed this day. Claude wrote the scripts, the implementation and the
+  tests; I ran the experiments and answered the design questions only in
+  part.
+
+### Prediction before measuring
+
+- p99 at 50 bookings/s and the slowest span: **not written** (I skipped it).
+- Block 2, written before looking: slow traces **cluster** (right); the
+  extra time is a **gap** (wrong: it was inside a span); `pg_stat_statements`
+  shows a ~1 s statement (wrong: max 221 ms).
+- Block 2, written with the output in front of me, so they don't really
+  count: whichever statement is in flight (right); a slow GET waits for a
+  connection (right); checkpoints line up with the stalls (wrong).
+- Diagnostic run: the in-VM probe stays fast (half right: 3 of 5
+  episodes); Kafka spikes (half right: biggest CPU user, not aligned with
+  the stalls).
+- The fix: Claude predicted GET p99 under 100 ms (wrong: 796 ms median),
+  at least one after-run over 500 ms (right), POST p99 unchanged (right).
+
+### What happened
+
+- **Baseline p99 was 281 ms median, range 79–1,071 ms**, on identical
+  code. p50 was ~30 ms in quiet runs.
+- **The slow requests came in bursts**: 1–1.7 s freezes, a few per two
+  minutes, hitting whatever each request was doing, even a `BEGIN` that
+  Postgres answers in 0.004 ms. No statement was slow inside Postgres and
+  no checkpoint ran during the runs.
+- **A slow GET waited 882 ms for a connection**, because frozen POSTs held
+  all 50. So I gave GETs their own pool.
+- **With the read pool, GET p99 didn't change**: 796 vs 739 ms median,
+  ranges overlapping. POST p99 didn't change either.
+- **Runs next to each other looked alike, whatever binary ran**: after-1
+  and before-7 both stalled, after-2 and before-8 were both clean.
+
+### What I understand now
+
+**p99 is decided by very few requests.** In a 2-minute run at 75
+requests/s, about 60 requests set p99. One 1-second freeze puts more than
+that in the tail, so on this machine p99 mostly answers "was there a freeze,
+and how long".
+
+**One run proves nothing about p99.** Identical code gave 79 ms and
+1,071 ms. A change only counts when the worst run after beats the best run
+before.
+
+**Alternate before and after runs.** The freezes came and went over about
+10 minutes. Running all the "before" runs first and all the "after" runs
+later would have credited, or blamed, the change for the machine's mood.
+
+**An open load model, with enough VUs.** k6's arrival-rate executor keeps
+sending even when the server is slow. With too few pre-allocated VUs it
+dropped the requests that arrived during a freeze, and p95 looked 2.5×
+better than it was.
+
+**Time can hide in three places.** In the API outside any span (the gap),
+inside a client span but not inside Postgres's execution (network, a
+paused machine, the commit), or inside Postgres (`pg_stat_statements`).
+The slow requests were the middle case: the API waited a second for an
+`UPDATE` that Postgres executed in under 95 ms.
+
+**`pg_stat_statements` doesn't count the commit.** 20,048 commits averaged
+0.006 ms, which is impossible if the disk flush were included.
+
+**A slow query looks different from a frozen machine.** A slow query is
+the same statement in every slow trace. A freeze is whatever happened to
+be in flight, including `BEGIN`.
+
+**A bulkhead only helps if the bottleneck is behind it.** A separate pool
+protects reads when writes hold all the connections while the database is
+fine (row-lock contention, say). Here the freeze reached the reads
+directly, so the bulkhead had nothing to protect them from. One trace
+made me think otherwise.
+
+**Same primary, not a replica.** A separate pool to the same database
+keeps read-your-writes: a GET right after a 201 always finds the booking.
+
+**"Usually N+1 or a missing index" didn't apply.** The data said: the
+environment, amplified by a shared pool. That's a finding too.
+
+### Things that went wrong
+
+- Skipped the p99 prediction, and gave some later predictions together
+  with the output.
+- `scripts/seed-load.sql` was saved as an empty file, and
+  `scripts/k6/load.js` wasn't saved at all; the first runs failed on that.
+- The VU change didn't get saved either, so one more run dropped requests.
+- Pasted a command with `<a slow id>` placeholders; zsh read `<` as a
+  redirect and ran nothing.
+- Skipped building `bin/after`, so three runs refused to start, and the
+  before runs came out not alternated; redid the sequence.
+- Re-ran before-1 before saving run 3's traces (no harm: run 1's stall was
+  bigger).
+- Claude's mistakes: too few pre-allocated VUs; a warm-up that swallowed
+  every k6 error; a missing `BIN_DIR` in a command; a bash-4-only line and
+  a jq version difference in `traces.sh`; "GET p99 is pool wait" concluded
+  from one trace; claiming 10 round trips per POST instead of 8.
+
+### Questions I should be able to answer
+
+- What are p50, p95 and p99, and why can't one run measure p99?
+- Why an open load model? What does k6 do with too few VUs during a stall?
+- How do you tell a slow query from a frozen machine in traces?
+- Where can a request's time hide besides a slow statement?
+- Why doesn't `pg_stat_statements` show the commit's disk flush?
+- What does a separate read pool protect against, and why didn't it help
+  here?
+- Why a separate pool to the same primary rather than a read replica?
+- Why alternate before and after runs, and why a burn-in run?
+
+### Still open
+
+- A slow GET trace from an after run (pool wait or `SELECT`?)
+- The read pool under hot-unit contention load
+- Where the stalls outside the VM come from; why Kafka uses ~3 CPUs
+- The idempotent response inside the booking transaction (8 → 7 round
+  trips, closes a crash window)
+- The same load on Linux / native Docker
