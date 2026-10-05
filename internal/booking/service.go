@@ -25,6 +25,7 @@ const (
 
 type Service struct {
 	store    Store
+	reader   BookingReader
 	logger   *slog.Logger
 	unsafe   bool
 	strategy string
@@ -47,15 +48,33 @@ type bookingCreatedPayload struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
-func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string) *Service {
-	return &Service{
+// BookingReader serves GET /bookings/{id}.
+type BookingReader interface {
+	GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error)
+}
+
+type Option func(*Service)
+
+// WithReader sends Get to r instead of the write store, so reads can use
+// their own connection pool.
+func WithReader(r BookingReader) Option {
+	return func(s *Service) { s.reader = r }
+}
+
+func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string, opts ...Option) *Service {
+	s := &Service{
 		store:                  store,
+		reader:                 store,
 		logger:                 logger,
 		unsafe:                 unsafe,
 		strategy:               strategy,
 		maxOptimisticRetries:   defaultMaxOptimisticRetries,
 		maxSerializableRetries: defaultMaxSerializableRetries,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 type Store interface {
@@ -346,7 +365,7 @@ func (s *Service) createSingleStatement(ctx context.Context, unitID, customerID 
 }
 
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (*storage.Booking, error) {
-	return s.store.GetBooking(ctx, id)
+	return s.reader.GetBooking(ctx, id)
 }
 
 func (s *Service) Retries() int64 { return s.retries.Load() }

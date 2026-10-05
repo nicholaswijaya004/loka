@@ -1197,3 +1197,86 @@ func TestServiceCreateFailsWhenEventCannotBeWritten(t *testing.T) {
 		t.Errorf("booking: got %+v, want nil — no event means no booking", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Reader — which store serves reads
+// -----------------------------------------------------------------------------
+
+// fakeReader is a BookingReader that records calls.
+type fakeReader struct {
+	booking *storage.Booking
+	calls   int
+}
+
+func (r *fakeReader) GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error) {
+	r.calls++
+	return r.booking, nil
+}
+
+func TestServiceGetUsesStoreByDefault(t *testing.T) {
+	want := &storage.Booking{BookingID: uuid.New()}
+	store := &fakeStore{booking: want}
+	svc := NewService(store, testLogger, false, "single")
+
+	got, err := svc.Get(context.Background(), want.BookingID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != want {
+		t.Errorf("booking: got %v, want the store's booking %v", got, want)
+	}
+}
+
+func TestServiceGetUsesReader(t *testing.T) {
+	want := &storage.Booking{BookingID: uuid.New()}
+	store := &fakeStore{bookingErr: errors.New("Get must not use the write store when a reader is set")}
+	reader := &fakeReader{booking: want}
+	svc := NewService(store, testLogger, false, "single", WithReader(reader))
+
+	got, err := svc.Get(context.Background(), want.BookingID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != want {
+		t.Errorf("booking: got %v, want the reader's booking %v", got, want)
+	}
+	if reader.calls != 1 {
+		t.Errorf("reader calls: got %d, want 1", reader.calls)
+	}
+}
+
+// TestServiceReplayStaysOnWriteStore pins down that an idempotent replay is
+// part of the POST and keeps using the write store, so POST work never takes
+// connections from the read pool.
+func TestServiceReplayStaysOnWriteStore(t *testing.T) {
+	originalID := uuid.New()
+	store := &fakeStore{
+		claimResult: false,
+		existingKey: &storage.IdempotencyKey{
+			Key:         testKey,
+			RequestHash: testHash,
+			State:       "completed",
+			BookingID:   &originalID,
+		},
+		booking: &storage.Booking{BookingID: originalID},
+	}
+	reader := &fakeReader{booking: &storage.Booking{BookingID: uuid.New()}}
+	svc := NewService(store, testLogger, false, "single", WithReader(reader))
+
+	got, replayed, err := svc.CreateIdempotent(
+		context.Background(), testKey, testHash,
+		testUnitID, testCustomerID, 1, testVisit,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !replayed {
+		t.Error("replayed: got false, want true")
+	}
+	if got.BookingID != originalID {
+		t.Errorf("booking id: got %v, want %v from the write store", got.BookingID, originalID)
+	}
+	if reader.calls != 0 {
+		t.Errorf("reader calls: got %d, want 0 — a replay must not use the read pool", reader.calls)
+	}
+}

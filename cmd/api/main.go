@@ -68,6 +68,14 @@ func main() {
 	}
 	cfg.MaxConns = 50
 	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	cfg.ConnConfig.RuntimeParams["application_name"] = "loka-api"
+
+	// GET /bookings/{id} reads through its own small pool, so it never queues
+	// behind POSTs that hold every write connection during a stall. Same
+	// primary, so a GET right after a 201 still finds the booking.
+	readCfg := cfg.Copy()
+	readCfg.MaxConns = 10
+	readCfg.ConnConfig.RuntimeParams["application_name"] = "loka-api-read"
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -76,10 +84,22 @@ func main() {
 	}
 	defer pool.Close()
 
+	readPool, err := pgxpool.NewWithConfig(ctx, readCfg)
+	if err != nil {
+		logger.Error("db read pool init failed", "error", err)
+		os.Exit(1)
+	}
+	defer readPool.Close()
+
 	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelPing()
 	if err := pool.Ping(pingCtx); err != nil {
 		logger.Error("db unreachable", "error", err)
+		os.Exit(1)
+	}
+
+	if err := readPool.Ping(pingCtx); err != nil {
+		logger.Error("db unreachable (read pool)", "error", err)
 		os.Exit(1)
 	}
 
@@ -97,7 +117,8 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("booking strategy", "strategy", strategy)
-	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy)
+	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy,
+		booking.WithReader(storage.NewStore(readPool)))
 
 	if unsafe {
 		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
