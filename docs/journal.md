@@ -1805,3 +1805,128 @@ environment, amplified by a shared pool. That's a finding too.
 - The idempotent response inside the booking transaction (8 → 7 round
   trips, closes a crash window)
 - The same load on Linux / native Docker
+
+## Day 25
+
+### What I built
+
+- **A Redis cache for the availability page** (`GET /units/{id}`),
+  cache-aside, with a 30 s TTL as the backstop. Booking never reads it: a
+  stale "sold out" loses a sale and a stale price loses money, and the
+  single-statement decrement (ADR-002) prevents overselling either way.
+- **Invalidation through the outbox**: `booking.created` and
+  `booking.cancelled` reach a new `cmd/cacheinvalidator`, which deletes the
+  unit's key. `booking.cancelled` gained `unit_id` and `qty` (version 2).
+- **Who wrote what:** I designed it in Block 1. I wrote the error sentinel,
+  the cache interface with its null object and option, the Redis adapter, the
+  first versions of `GetUnit`, the handler and the invalidator, and the
+  `GetUnit` handler itself. Claude wrote all the tests, the final fixes to
+  `GetUnit`, the response struct and the invalidator (when I asked for
+  speed), the step 4 diffs, and the wiring, compose and load scripts.
+
+### Prediction before measuring
+
+- Block 1: cache-on `GET /units` p50 2–3 ms, p99 5–8 ms. **Wrong:** p50
+  4.3–15 ms, p99 64 ms–1.7 s, and not better than cache-off at all.
+- TTL 30–60 s. The TTL turned out not to matter: invalidation every 20 s
+  ends every entry first.
+- Block 3 and the follow-ups: **not written** (I skipped them three times).
+- Claude: hit-rate ceiling 80% at 200/s (right: 79–81%); ~18,000 fewer unit
+  reads per run (right: ~17,800); ~18,000 vs ~11,000 calls at 100/s (right:
+  18,202 vs 10,881–11,424).
+
+### What happened
+
+- **At 200 reads/s the machine was overloaded**: 4 of 6 runs dropped
+  requests, POST p50 rose to 77–220 ms. In the 2 valid runs and all the
+  invalid ones, latency ranges overlapped. The cache took 74% of the
+  availability reads off Postgres.
+- **The 50 ms timeout fired on 7–8% of reads**, 1,700–2,000 per run, each
+  costing 50 ms before Postgres even started.
+- **At 100 reads/s all runs were valid**, and the cache made reads
+  **slower**: p50 +0.5 ms, p95 about 2×, no overlap. It still took 58% of
+  the reads off Postgres.
+- **A 250 ms timeout changed nothing**: the same fallbacks, the same
+  latency.
+
+### What I understand now
+
+**A cache makes a read faster only if what's behind it is slower than the
+cache.** Here Postgres answered in 0.2 ms; the cost was the network trip,
+and Redis is the same trip. What I got was database offload, not speed.
+
+**A miss costs more than no cache.** GET the cache, read Postgres, SET the
+cache: three trips instead of one. At a 59% hit rate, 41% of reads paid
+that, and p95 showed it.
+
+**The hit rate is set by how often a key is read between invalidations.**
+Every unit is booked every 20 s, so the 30 s TTL never fires. Half the
+reads per unit took the hit rate from 80% to 59%.
+
+**A timeout can't fix a frozen machine.** It only decides how long you wait
+before falling back. Set it above the dependency's normal slow requests,
+and expect a freeze to blow through any value.
+
+**Libraries retry in places you don't see.** go-redis dials 5 times, 100 ms
+apart, by default, separately from `MaxRetries`. Every read waited ~400 ms
+with Redis down until a test actually stopped Redis.
+
+**Delete, after commit, through the outbox.** DEL can't install an old value
+the way an out-of-order SET can. Deleting after commit means a reader can't
+refill the old row in between. The TTL covers a crash between commit and
+delete.
+
+**Poison or retry is the consumer's most important decision.** Bad JSON
+never becomes good, so skip it. Redis down gets better, so retry without
+committing. Get it backwards and you either block a partition forever or
+lose invalidations silently.
+
+**Events evolve by adding fields and bumping the version.** Consumers read
+only the fields they need (tolerant reader), and old events decode with
+the new fields zero.
+
+**`.gitignore` patterns match at any depth.** `api` hid every new file in
+`internal/api/`.
+
+### Things that went wrong
+
+- `redis.go` wasn't saved, so a test failed against code I thought I had
+  fixed (the second unsaved file in two days).
+- I copied `Ping` from a syntax example into `Set`/`Delete`: check-then-act,
+  and it passed the first four tests.
+- The response started as a `map`, missing two fields; then a struct with
+  `omitempty` that dropped `description`.
+- The first invalidator deleted `unit:00000000-…` on a missing unit and
+  retried bad JSON forever.
+- `loadruns/burn-1` already existed, so the burn-in refused to start, and
+  the next six runs had no binaries. Fixed with a new label and `&&`.
+- I couldn't apply the `+`/`-` diffs by hand; full files worked.
+- No predictions for Block 3 or the follow-ups.
+- Claude's mistakes: a test gap (Ping-then-Set passed); the 50 ms timeout
+  chosen without measuring; go-redis's dial retries found only by a manual
+  check; a broken shell heredoc that left four stray files in its own
+  container; saying "a Redis hop costs more than Postgres", which the data
+  can't separate from the miss share.
+
+### Questions I should be able to answer
+
+- When does a cache lower latency, and when does it only offload the
+  database?
+- Why can a cache make p95 worse? Count the round trips for a miss.
+- Cache-aside: why DEL rather than SET on write, and why after commit?
+- What sets the hit rate here, and why didn't the TTL matter?
+- Why invalidate through the outbox and Kafka instead of from the API?
+- How does the invalidator choose between skipping and retrying an event?
+- How do you add fields to an event without breaking old consumers or old
+  events?
+- What should a cache client's timeout and retries be, and what can't a
+  timeout fix?
+- Why must the booking path never read the cache?
+
+### Still open
+
+- An in-process cache; filling after the response; caching an expensive
+  query instead
+- The exact hit-rate model; Redis spans in traces
+- A Redis-only invalidator loop; a circuit breaker; rate-limited warnings
+- The same comparison on Linux / native Docker

@@ -1542,3 +1542,158 @@ session, earlier): before-4..6 GET p99 20.2 / 685.2 / 772.3, POST p99
 - First-run drift: a first run with no heavy work before it; `pmset -g therm`
 - VM swap counters (`vmmon.txt`) not checked
 - The same load on Linux / native Docker, to separate the machine from Loka
+
+## Day 25
+
+**Goal:** Cache inventory units in Redis for the availability page
+(`GET /units/{id}`), invalidate on every write that changes a unit, and
+measure the hit rate and the read p99 delta.
+
+**Settings:**
+
+| Setting      | Value                                                                                                                                                                | Why                                                        |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| load         | Day 24's (POST 50/s round-robin over 1,000 units, `GET /bookings/{id}` 25/s) + `GET /units/{id}` at 200/s (Block 3) or 100/s (follow-up), a uniform random unit each | reads arrive independently per unit, as from many browsers |
+| cache        | cache-aside, `UNIT_CACHE_TTL` 30 s; 0 = off with the same binary                                                                                                     | before and after differ only by one env var                |
+| invalidation | outbox → relay (500 ms poll) → Kafka → `cmd/cacheinvalidator`: `DEL unit:<id>` on `booking.created` and `booking.cancelled`                                          | after commit, never before; DEL, not overwrite             |
+| Redis        | `redis:7.4-alpine`, no persistence, `maxmemory 64mb allkeys-lru`, container limit 128M                                                                               | a cache, never a source of truth                           |
+| API client   | read/write timeout 50 ms (250 ms in one arm), dial 200 ms, `MaxRetries -1`, `DialerRetries 1`                                                                        | fail fast and fall back to Postgres                        |
+| run          | Day 24's, plus `CONFIG RESETSTAT` after the warm-up; hit rate from `INFO stats`; fallbacks counted in `api.log`                                                      | only the measured window counts                            |
+| valid run    | 0 failed, 0 dropped                                                                                                                                                  | decided before the runs                                    |
+| improvement  | only if the worst run of one arm beats the best run of the other                                                                                                     | p99 is noisy                                               |
+| machine      | Day 24's (MacBook Pro 2019 i9, Docker Desktop 8 CPUs / 2 GB)                                                                                                         | numbers are this machine's                                 |
+
+**Built:**
+
+- **`GET /units/{id}`**: the service reads the cache first, then the read
+  pool. A miss stores the unit. A cache failure is logged and served from
+  Postgres without storing. `POST /bookings` never touches the cache.
+- **`internal/unitcache`**: the Redis adapter (`Get` / `Set` with TTL /
+  `Delete`, JSON values, key `unit:<id>`) and the invalidator, a
+  `consumer.Handler`. A v1 `booking.cancelled` without a unit is logged and
+  skipped; a v2 or `booking.created` without a unit, or bad JSON, is poison;
+  a Redis error is retried without committing the offset.
+- **`booking.cancelled` v2**: adds `unit_id` and `qty`, written by the
+  expirer and by the payment worker on a decline. v1 events still decode.
+- **`cmd/cacheinvalidator`**: its own consumer group; a new group starts at
+  the newest offset.
+- **Load tooling**: a Redis service in compose; `loadrun.sh` starts the sixth
+  binary, records `settings.txt`, and prints the hit rate and fallback
+  count; `load.js` adds the `GET /units/{id}` scenario (`UNIT_RATE`).
+- **`.gitignore`**: `api` → `/api`. The old pattern ignored every path named
+  `api`, including new files in `internal/api/`.
+
+**Tests added:**
+
+| Package                 | Proves                                                                                                                                                              | Result           |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| booking (unit)          | `GetUnit`: hit; miss stores; a failed store still answers; cache down → Postgres, no store; unknown unit; Postgres failure; cache off; booking never uses the cache | ✓ 3 (8 cases)    |
+| booking (unit)          | a v1 `booking.cancelled` decodes, `unit_id` and `qty` zero                                                                                                          | ✓ 1              |
+| booking (integration)   | the expirer's event carries `unit_id` and `qty`, read from the JSON keys                                                                                            | ✓ 1              |
+| payments (integration)  | the decline event carries `unit_id` and `qty`                                                                                                                       | ✓ 1              |
+| unitcache (integration) | real Redis: miss then round trip; TTL set; delete → miss, twice OK; Redis down is not a miss; a refused SET (OOM) is reported                                       | ✓ 5              |
+| unitcache (unit)        | invalidator: created / cancelled v2 delete; v1 skipped and logged; no unit or bad JSON → poison; confirmed / unknown ignored; Redis down → retryable                | ✓ 1 (9 subtests) |
+| api (unit)              | 200 with exactly 8 fields and `description: null`; 400 before the service; 404; 500 logged, cause not in the body                                                   | ✓ 1 (5 subtests) |
+
+All with `-race`. Checked against broken code, each caught by at least one
+test: Ping-then-Set, every handler/invalidator break listed in the PR
+(missing fields, `omitempty`, leaked error, error swallowed, Redis error as
+poison, bad JSON retried forever, version not bumped, wrong JSON tag,
+hard-coded qty).
+
+**Smoke checks** (my Linux container, real stack, not comparable to the Mac):
+miss → `SET` with TTL 30 → hit; after a 201 the key was gone in ~400 ms and
+the next read showed the new availability; Redis stopped → 200 from Postgres.
+With go-redis's default dial retries (5 × 100 ms) every read with Redis down
+took ~408 ms; with `DialerRetries: 1`, ~3 ms.
+
+**Block 3: `UNIT_RATE=200`, 1 burn-in + 3 + 3 alternated** (ms):
+
+| Order | Run      | Valid | units p50 | p95      | p99      | POST p50 | POST p99 | Dropped | Hit rate | Fallbacks | unit `SELECT` calls |
+| ----- | -------- | ----- | --------- | -------- | -------- | -------- | -------- | ------- | -------- | --------- | ------------------- |
+| 0     | burn25-1 | –     | 8.91      | 115.71   | 1,036.56 | 99.13    | 1,250.81 | 27      | 80.7%    | 1,091     | –                   |
+| 1     | off-1    | ✓     | 10.31     | 52.42    | 565.74   | 113.93   | 973.70   | 0       | –        | –         | 30,202              |
+| 2     | on-1     | ✗     | 9.35      | 868.29   | 1,667.10 | 99.34    | 2,005.76 | 112     | 79.3%    | 2,026     | 12,757              |
+| 3     | off-2    | ✗     | 7.77      | 1,315.65 | 2,261.53 | 76.98    | 3,293.89 | 220     | –        | –         | 29,982              |
+| 4     | on-2     | ✓     | 14.94     | 277.30   | 830.34   | 172.43   | 1,199.17 | 0       | 81.0%    | 1,720     | 12,158              |
+| 5     | off-3    | ✗     | 17.25     | 81.62    | 735.24   | 219.54   | 1,989.83 | 32      | –        | –         | 30,169              |
+| 6     | on-3     | ✗     | 11.43     | 297.05   | 1,052.99 | 126.77   | 1,483.65 | 44      | 80.3%    | 1,738     | 12,308              |
+
+2 of 6 runs valid. Latency: every range overlaps, **no change shown**.
+POST p50 77–220 ms vs ~30 ms on Day 24: this load was beyond the machine.
+
+**Follow-up: `UNIT_RATE=100`, 1 burn-in + 3 × (off, on 50 ms, on 250 ms)** (ms):
+
+| Run        | units p50 | p95   | p99    | POST p99 | Hit rate | Fallbacks | unit `SELECT` calls |
+| ---------- | --------- | ----- | ------ | -------- | -------- | --------- | ------------------- |
+| lo-burn-1  | 8.15      | 44.32 | 843.49 | 1,291.60 | 66.0%    | 483       | –                   |
+| lo-off-1   | 4.04      | 7.55  | 494.08 | 858.95   | –        | –         | 18,202              |
+| lo-on50-1  | 4.32      | 12.54 | 63.93  | 258.07   | 58.5%    | 146       | 11,266              |
+| lo-on250-1 | 4.53      | 14.13 | 618.11 | 769.44   | 58.8%    | 204       | 11,265              |
+| lo-off-2   | 3.69      | 6.69  | 478.07 | 836.64   | –        | –         | 18,201              |
+| lo-on50-2  | 4.55      | 14.86 | 766.78 | 1,005.96 | 58.4%    | 402       | 11,424              |
+| lo-on250-2 | 4.57      | 20.49 | 843.75 | 1,052.42 | 59.2%    | 394       | 11,329              |
+| lo-off-3   | 3.65      | 6.21  | 34.82  | 129.87   | –        | –         | 18,202              |
+| lo-on50-3  | 4.37      | 12.71 | 566.87 | 727.29   | 58.4%    | 205       | 11,311              |
+| lo-on250-3 | 5.14      | 16.96 | 185.25 | 539.66   | 61.4%    | 86        | 10,881              |
+
+All 9 measured runs valid. POST p50 30–34 ms (back to Day 24's level).
+
+| Comparison (`GET /units`) | p50                                                 | p95                                                   | p99     |
+| ------------------------- | --------------------------------------------------- | ----------------------------------------------------- | ------- |
+| off vs on 50 ms           | **off faster**, no overlap (3.65–4.04 vs 4.32–4.55) | **off ~2× faster**, no overlap (6.2–7.6 vs 12.5–14.9) | overlap |
+| on 50 ms vs on 250 ms     | overlap                                             | overlap                                               | overlap |
+| fallbacks 50 vs 250 ms    | 146–402 vs 86–394: overlap                          |                                                       |         |
+
+**Postgres reads of the unit row** (one statement; the POST path adds 6,200
+per run in both arms, 6,000 load + 200 from setup):
+
+| Load  | Off: total (read path) | On: total (read path)       | Total    | Read path |
+| ----- | ---------------------- | --------------------------- | -------- | --------- |
+| 200/s | ~30,100 (~23,900)      | 12,158–12,757 (5,958–6,557) | **−59%** | **−74%**  |
+| 100/s | 18,202 (12,002)        | 10,881–11,424 (4,681–5,224) | **−38%** | **−58%**  |
+
+With the cache off, the read path's calls equal the `GET /units` count
+(e.g. 12,002 vs 12,001); with it on, misses + fallbacks (4,928 + 146 =
+5,074 vs 5,066 for lo-on50-1).
+
+**Observations:**
+
+- **The cache cut Postgres reads but did not make reads faster.** A
+  primary-key `SELECT` costs ~0.2 ms in Postgres; the rest is the round trip
+  through Docker Desktop, the same trip a Redis `GET` makes.
+- **At 59% hits the cache made reads slower:** p50 +~0.5 ms and p95 ~2×,
+  with no overlap. A miss is 3 round trips (Redis `GET`, Postgres, Redis
+  `SET`), so with ~41% misses p95 lands on a miss, and p50 lands in the
+  slower part of the hits.
+- **Hit rate follows reads per unit per invalidation, not the TTL.** Every
+  unit is booked every 20 s, so the 30 s TTL never fires. 200/s → 79–81%,
+  100/s → 58–61%. Share of all reads served from the cache, counting
+  fallbacks as misses: 73–76% and 57–61%.
+- **A longer timeout didn't reduce fallbacks.** 50 ms and 250 ms gave the
+  same counts: the slow Redis calls are the machine's ~1 s freezes, longer
+  than any sensible timeout. At 200/s the 50 ms timeout fired on 7–8% of
+  reads; at 100/s on 1–3%.
+- **Hidden retries in the client:** go-redis's `DialerRetries` (default 5,
+  100 ms apart; ≤ 0 means default) is separate from `MaxRetries`. Only a
+  test with Redis actually down showed it.
+- **p99 is still decided by the stalls**, in both arms at both loads.
+
+**Open:**
+
+- An in-process (L1) cache: no network hop, the only way here to make a hot
+  primary-key read faster
+- Fill the cache after responding (a miss becomes 2 round trips, not 3)
+- Cache an expensive query (availability across dates) instead of a
+  primary-key lookup, and measure there
+- The exact hit-rate model: measured 79–81% / 58–61% sits between a Poisson
+  model (80% / 66.7%) and a fixed-interval invalidation model (75.5% / 56.8%)
+- Redis spans in traces (`redisotel`): today a hit is invisible in Jaeger
+- A Redis-only consumer loop without the `processed_events` claim (~50
+  Postgres writes/s that `DEL` doesn't need)
+- A circuit breaker for Redis, and rate-limited fallback warnings (200/s of
+  WARN lines during an outage)
+- Versioned cache keys (`unit:v1:`), so a struct change can't decode old
+  entries
+- Per-unit TTL, negative caching, CDC as an invalidation source
+- The same comparison on Linux / native Docker
