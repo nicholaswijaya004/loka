@@ -1202,15 +1202,27 @@ func TestServiceCreateFailsWhenEventCannotBeWritten(t *testing.T) {
 // Reader — which store serves reads
 // -----------------------------------------------------------------------------
 
-// fakeReader is a BookingReader that records calls.
+// fakeReader is a Reader that records calls.
 type fakeReader struct {
 	booking *storage.Booking
 	calls   int
+
+	unit      *storage.InventoryUnit
+	unitErr   error
+	unitCalls int
 }
 
 func (r *fakeReader) GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error) {
 	r.calls++
 	return r.booking, nil
+}
+
+func (r *fakeReader) GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	r.unitCalls++
+	if r.unitErr != nil {
+		return nil, r.unitErr
+	}
+	return r.unit, nil
 }
 
 func TestServiceGetUsesStoreByDefault(t *testing.T) {
@@ -1278,5 +1290,173 @@ func TestServiceReplayStaysOnWriteStore(t *testing.T) {
 	}
 	if reader.calls != 0 {
 		t.Errorf("reader calls: got %d, want 0 — a replay must not use the read pool", reader.calls)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// GetUnit — the availability page: cache first, then the read pool
+// -----------------------------------------------------------------------------
+
+// fakeUnitCache is a UnitCache that returns what the test configured and
+// records calls.
+type fakeUnitCache struct {
+	unit     *storage.InventoryUnit
+	getErr   error
+	getCalls int
+
+	setErr   error
+	setCalls int
+	setUnit  *storage.InventoryUnit
+}
+
+func (c *fakeUnitCache) Get(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	c.getCalls++
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
+	return c.unit, nil
+}
+
+func (c *fakeUnitCache) Set(ctx context.Context, u *storage.InventoryUnit) error {
+	c.setCalls++
+	c.setUnit = u
+	return c.setErr
+}
+
+// errCacheDown stands in for Redis being unreachable or timing out.
+var errCacheDown = errors.New("redis: connection refused")
+
+func TestServiceGetUnit(t *testing.T) {
+	cached := testUnit(7, 10, 1)
+	fresh := testUnit(4, 10, 1)
+	// The write store must never serve the availability page.
+	writeStoreErr := errors.New("GetUnit must not read the write store")
+
+	tests := []struct {
+		name   string
+		cache  *fakeUnitCache
+		reader *fakeReader
+
+		want        *storage.InventoryUnit
+		wantErr     error
+		readerCalls int
+		setCalls    int
+	}{
+		{
+			name:   "hit: served from the cache, no database read",
+			cache:  &fakeUnitCache{unit: cached},
+			reader: &fakeReader{unit: fresh},
+			want:   cached, readerCalls: 0, setCalls: 0,
+		},
+		{
+			name:   "miss: read from the read pool and stored in the cache",
+			cache:  &fakeUnitCache{getErr: ErrCacheMiss},
+			reader: &fakeReader{unit: fresh},
+			want:   fresh, readerCalls: 1, setCalls: 1,
+		},
+		{
+			name:   "miss and the store fails: still answered, the error is not returned",
+			cache:  &fakeUnitCache{getErr: ErrCacheMiss, setErr: errCacheDown},
+			reader: &fakeReader{unit: fresh},
+			want:   fresh, readerCalls: 1, setCalls: 1,
+		},
+		{
+			name:   "cache down: falls back to the read pool and does not try to store",
+			cache:  &fakeUnitCache{getErr: errCacheDown},
+			reader: &fakeReader{unit: fresh},
+			want:   fresh, readerCalls: 1, setCalls: 0,
+		},
+		{
+			name:    "unknown unit: not found is returned and nothing is stored",
+			cache:   &fakeUnitCache{getErr: ErrCacheMiss},
+			reader:  &fakeReader{unitErr: storage.ErrUnitNotFound},
+			wantErr: storage.ErrUnitNotFound, readerCalls: 1, setCalls: 0,
+		},
+		{
+			name:    "database fails: the error is returned and nothing is stored",
+			cache:   &fakeUnitCache{getErr: ErrCacheMiss},
+			reader:  &fakeReader{unitErr: errStore},
+			wantErr: errStore, readerCalls: 1, setCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{unitErr: writeStoreErr}
+			svc := NewService(store, testLogger, false, "single",
+				WithReader(tt.reader), WithUnitCache(tt.cache))
+
+			got, err := svc.GetUnit(context.Background(), testUnitID)
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error: got %v, want %v", err, tt.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tt.want {
+					t.Errorf("unit: got %+v, want %+v", got, tt.want)
+				}
+			}
+			if tt.cache.getCalls != 1 {
+				t.Errorf("cache GetUnit calls: got %d, want 1", tt.cache.getCalls)
+			}
+			if tt.reader.unitCalls != tt.readerCalls {
+				t.Errorf("read-pool calls: got %d, want %d", tt.reader.unitCalls, tt.readerCalls)
+			}
+			if tt.cache.setCalls != tt.setCalls {
+				t.Errorf("cache SetUnit calls: got %d, want %d", tt.cache.setCalls, tt.setCalls)
+			}
+			if tt.setCalls == 1 && tt.cache.setUnit != tt.want {
+				t.Errorf("stored unit: got %+v, want the unit read from the database", tt.cache.setUnit)
+			}
+			if store.unitCalls != 0 {
+				t.Errorf("write store GetInventoryUnit calls: got %d, want 0", store.unitCalls)
+			}
+		})
+	}
+}
+
+// TestServiceGetUnitCacheOff checks the default: with no WithUnitCache,
+// every call reads Postgres (here, the write store, as no reader is set).
+func TestServiceGetUnitCacheOff(t *testing.T) {
+	want := testUnit(4, 10, 1)
+	store := &fakeStore{unit: want}
+	svc := NewService(store, testLogger, false, "single")
+
+	for i := 0; i < 2; i++ {
+		got, err := svc.GetUnit(context.Background(), testUnitID)
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i+1, err)
+		}
+		if got != want {
+			t.Errorf("call %d: unit: got %+v, want %+v", i+1, got, want)
+		}
+	}
+	if store.unitCalls != 2 {
+		t.Errorf("database reads: got %d, want 2 (no cache)", store.unitCalls)
+	}
+}
+
+// TestServiceCreateNeverUsesUnitCache pins down that the booking path reads
+// the unit from the write store, even when the cache holds a different value.
+func TestServiceCreateNeverUsesUnitCache(t *testing.T) {
+	store := &fakeStore{unit: testUnit(4, 10, 1)}
+	stale := testUnit(0, 10, 1) // the cache says sold out; the database has 4
+	stale.PriceMinor = 1        // and a wrong price
+	cache := &fakeUnitCache{unit: stale}
+	svc := NewService(store, testLogger, false, "single", WithUnitCache(cache))
+
+	b, err := svc.Create(context.Background(), testUnitID, testCustomerID, 1, testVisit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (a stale cached 'sold out' must not reject a booking)", err)
+	}
+	if b.TotalMinor != store.unit.PriceMinor {
+		t.Errorf("total: got %d, want %d from the database price", b.TotalMinor, store.unit.PriceMinor)
+	}
+	if cache.getCalls != 0 {
+		t.Errorf("cache GetUnit calls during Create: got %d, want 0", cache.getCalls)
 	}
 }

@@ -59,6 +59,23 @@ services:
       timeout: 10s
       retries: 10
 
+  # A cache, never a source of truth: nothing to persist, and a memory cap
+  # with LRU eviction so it can't grow without bound.
+  redis:
+    image: redis:7.4-alpine
+    command: ['redis-server', '--save', '', '--appendonly', 'no', '--maxmemory', '64mb', '--maxmemory-policy', 'allkeys-lru']
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
   jaeger:
     image: jaegertracing/jaeger:2.21.0
     ports:

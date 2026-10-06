@@ -25,7 +25,8 @@ const (
 
 type Service struct {
 	store    Store
-	reader   BookingReader
+	reader   Reader
+	cache    UnitCache
 	logger   *slog.Logger
 	unsafe   bool
 	strategy string
@@ -48,23 +49,54 @@ type bookingCreatedPayload struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
-// BookingReader serves GET /bookings/{id}.
-type BookingReader interface {
+// Reader serves the read-only endpoints (GET /bookings/{id}, GET /units/{id})
+// through their own connection pool. It reads the same primary as the write
+// path, so a GET right after a 201 always finds the booking. The booking path
+// never uses it.
+type Reader interface {
 	GetBooking(ctx context.Context, id uuid.UUID) (*storage.Booking, error)
+	GetInventoryUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
 }
 
 type Option func(*Service)
 
+// UnitCache holds units for the availability page. Get returns ErrCacheMiss
+// when it has no entry for the unit; any other error means the cache itself
+// failed. Entries may be stale, so the booking path never reads it.
+type UnitCache interface {
+	Get(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error)
+	Set(ctx context.Context, unit *storage.InventoryUnit) error
+}
+
+// noCache is the UnitCache when caching is off: every Get is a miss and Set
+// keeps nothing, so GetUnit always reads Postgres without a nil check.
+type noCache struct{}
+
+func (noCache) Get(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	return nil, ErrCacheMiss
+}
+
+func (noCache) Set(ctx context.Context, unit *storage.InventoryUnit) error {
+	return nil
+}
+
 // WithReader sends Get to r instead of the write store, so reads can use
 // their own connection pool.
-func WithReader(r BookingReader) Option {
+func WithReader(r Reader) Option {
 	return func(s *Service) { s.reader = r }
+}
+
+// WithUnitCache puts c in front of GetUnit. Without it, GetUnit reads
+// Postgres on every call.
+func WithUnitCache(c UnitCache) Option {
+	return func(s *Service) { s.cache = c }
 }
 
 func NewService(store Store, logger *slog.Logger, unsafe bool, strategy string, opts ...Option) *Service {
 	s := &Service{
 		store:                  store,
 		reader:                 store,
+		cache:                  noCache{},
 		logger:                 logger,
 		unsafe:                 unsafe,
 		strategy:               strategy,
@@ -132,6 +164,33 @@ func (s *Service) Create(ctx context.Context, unitID, customerID uuid.UUID, qty 
 		return s.createSerializable(ctx, unitID, customerID, qty, visitDateTime)
 	}
 	return s.createSingleStatement(ctx, unitID, customerID, qty, visitDateTime)
+}
+
+// GetUnit returns a unit for the availability page: the cache first, then the
+// read pool. A cache failure never fails the request; it costs a Postgres read
+// and a warning.
+func (s *Service) GetUnit(ctx context.Context, id uuid.UUID) (*storage.InventoryUnit, error) {
+	unit, err := s.cache.Get(ctx, id)
+	if err == nil {
+		return unit, nil
+	}
+	cacheDown := !errors.Is(err, ErrCacheMiss)
+	if cacheDown {
+		s.logger.Warn("unit cache unavailable, reading postgres", "unit_id", id, "error", err)
+	}
+
+	unit, err = s.reader.GetInventoryUnit(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Storing into a cache that just failed would only add another timeout.
+	if !cacheDown {
+		if err := s.cache.Set(ctx, unit); err != nil {
+			s.logger.Warn("unit cache store failed", "unit_id", id, "error", err)
+		}
+	}
+	return unit, nil
 }
 
 func (s *Service) insertBookingWithEvent(ctx context.Context, tx Store, b *storage.Booking) error {
