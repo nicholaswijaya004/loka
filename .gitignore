@@ -1,5 +1,5 @@
 bin/
 .env
 *.log
-api
+/api
 loadruns/

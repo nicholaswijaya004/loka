@@ -12,12 +12,14 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/nicholaswijaya004/loka/internal/api"
 	"github.com/nicholaswijaya004/loka/internal/booking"
 	"github.com/nicholaswijaya004/loka/internal/storage"
 	"github.com/nicholaswijaya004/loka/internal/telemetry"
+	"github.com/nicholaswijaya004/loka/internal/unitcache"
 )
 
 type storeAdapter struct {
@@ -117,8 +119,57 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("booking strategy", "strategy", strategy)
-	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy,
-		booking.WithReader(storage.NewStore(readPool)))
+
+	opts := []booking.Option{booking.WithReader(storage.NewStore(readPool))}
+
+	// GET /units/{id} reads through Redis when UNIT_CACHE_TTL > 0. 0 turns the
+	// cache off, so one binary serves both sides of a before/after run.
+	ttl, err := time.ParseDuration(envOr("UNIT_CACHE_TTL", "30s"))
+	if err != nil || ttl < 0 {
+		logger.Error("bad UNIT_CACHE_TTL", "value", os.Getenv("UNIT_CACHE_TTL"), "error", err)
+		os.Exit(1)
+	}
+	if ttl > 0 {
+		redisAddr := envOr("REDIS_ADDR", "localhost:6379")
+		// Above Redis's normal round trip, far below a request's budget. Too
+		// short, and a slow-but-healthy Redis turns into fallbacks.
+		timeout, err := time.ParseDuration(envOr("UNIT_CACHE_TIMEOUT", "50ms"))
+		if err != nil || timeout <= 0 {
+			logger.Error("bad UNIT_CACHE_TIMEOUT", "value", os.Getenv("UNIT_CACHE_TIMEOUT"), "error", err)
+			os.Exit(1)
+		}
+		rdb := redis.NewClient(&redis.Options{
+			Addr: redisAddr,
+			// A cache answers fast or not at all: on a timeout GetUnit falls
+			// back to Postgres instead of waiting. No retries either, at both
+			// layers: MaxRetries for commands, DialerRetries for connecting
+			// (its default, 5 dials 100 ms apart, made every read wait
+			// ~400 ms while Redis was down).
+			DialTimeout:   200 * time.Millisecond,
+			ReadTimeout:   timeout,
+			WriteTimeout:  timeout,
+			MaxRetries:    -1,
+			DialerRetries: 1,
+		})
+		defer func() {
+			if err := rdb.Close(); err != nil {
+				logger.Error("redis close failed", "error", err)
+			}
+		}()
+
+		// Redis down at startup is not fatal: GetUnit falls back to Postgres,
+		// and the client reconnects on its own once Redis is back.
+		if err := rdb.Ping(pingCtx).Err(); err != nil {
+			logger.Warn("redis unreachable at startup, unit reads go to postgres until it is back",
+				"addr", redisAddr, "error", err)
+		}
+		opts = append(opts, booking.WithUnitCache(unitcache.New(rdb, ttl)))
+		logger.Info("unit cache on", "addr", redisAddr, "ttl", ttl.String(), "timeout", timeout.String())
+	} else {
+		logger.Info("unit cache off")
+	}
+
+	svc := booking.NewService(storeAdapter{store}, logger, unsafe, strategy, opts...)
 
 	if unsafe {
 		logger.Warn("running with UNSAFE_DECREMENT — demonstration mode only")
@@ -154,6 +205,7 @@ func main() {
 
 	mux.Handle("POST /bookings", otelhttp.NewHandler(http.HandlerFunc(h.CreateBooking), "POST /bookings"))
 	mux.Handle("GET /bookings/{id}", otelhttp.NewHandler(http.HandlerFunc(h.GetBooking), "GET /bookings/{id}"))
+	mux.Handle("GET /units/{id}", otelhttp.NewHandler(http.HandlerFunc(h.GetUnit), "GET /units/{id}"))
 
 	srv := &http.Server{
 		Addr:         ":8080",
@@ -195,4 +247,11 @@ func main() {
 	logger.Info("retries", "strategy", strategy, "total", svc.Retries())
 
 	logger.Info("shutdown complete")
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

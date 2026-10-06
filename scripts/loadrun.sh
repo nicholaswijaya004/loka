@@ -2,9 +2,10 @@
 # scripts/loadrun.sh
 #
 # One measured run of the steady-load test, from an identical starting state:
-#   build -> make reset -> load seed -> start all five binaries -> warm-up
-#   (discarded) -> CHECKPOINT + ANALYZE + reset pg_stat_statements ->
-#   measured k6 run -> dump pg_stat_statements and pipeline state -> stop.
+#   build -> make reset -> load seed -> start all six binaries -> warm-up
+#   (discarded) -> CHECKPOINT + ANALYZE + reset pg_stat_statements and the
+#   Redis counters -> measured k6 run -> dump pg_stat_statements, the Redis
+#   hit rate and pipeline state -> stop.
 #
 # Containers stay up afterwards, so Jaeger keeps this run's traces until the
 # next reset.
@@ -13,13 +14,14 @@
 #   LABEL=before RUN=1 ./scripts/loadrun.sh
 #   LABEL=after  RUN=1 BUILD=0 ./scripts/loadrun.sh   # reuse bin/after
 #   LABEL=diag   RUN=1 BUILD=0 BIN_DIR=bin/before MONITOR=1 ./scripts/loadrun.sh
+#   LABEL=nocache RUN=1 UNIT_CACHE_TTL=0 ./scripts/loadrun.sh   # cache off
 #
 # MONITOR=1 adds docker-stats.txt and probe.log: a pgbench client inside the
 # Postgres container running SELECT 1 at 20/s over the local socket. It adds
 # load of its own, so a monitored run is for diagnosis, never a measurement.
 #
-# Output: loadruns/<LABEL>-<RUN>/ (k6.txt, k6-summary.json,
-# pg_stat_statements.txt, db-state.txt, one log per binary).
+# Output: loadruns/<LABEL>-<RUN>/ (settings.txt, k6.txt, k6-summary.json,
+# pg_stat_statements.txt, redis-stats.txt, db-state.txt, one log per binary).
 
 set -euo pipefail
 
@@ -31,8 +33,10 @@ WARMUP="${WARMUP:-15s}"
 DURATION="${DURATION:-2m}"
 PAYMOCK_LATENCY_MS="${PAYMOCK_LATENCY_MS:-100}"
 MONITOR="${MONITOR:-0}" # 1 = record docker stats + an in-VM SELECT 1 probe (diagnosis only)
+UNIT_CACHE_TTL="${UNIT_CACHE_TTL:-30s}" # 0 = unit cache off, same binaries
+UNIT_CACHE_TIMEOUT="${UNIT_CACHE_TIMEOUT:-50ms}" # Redis read/write timeout in the API
 OUT="loadruns/${LABEL}-${RUN}"
-BINARIES=(paymock api relay payments notifier)
+BINARIES=(paymock api relay payments notifier cacheinvalidator)
 
 PIDS=()
 
@@ -83,6 +87,14 @@ if [[ -e "$OUT" ]]; then
   exit 1
 fi
 mkdir -p "$OUT"
+# What this run was, next to its results.
+{
+  echo "commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- . ':!loadruns' || echo '+dirty')"
+  echo "bin_dir=$BIN_DIR"
+  echo "unit_cache_ttl=$UNIT_CACHE_TTL unit_cache_timeout=$UNIT_CACHE_TIMEOUT"
+  echo "unit_rate=${UNIT_RATE:-200}"
+  echo "warmup=$WARMUP duration=$DURATION paymock_latency_ms=$PAYMOCK_LATENCY_MS"
+} >"$OUT/settings.txt"
 
 if [[ "$BUILD" == 1 ]]; then
   echo "==> Building into $BIN_DIR"
@@ -112,11 +124,12 @@ fi
 echo "==> Starting binaries"
 LATENCY_MS="$PAYMOCK_LATENCY_MS" "$BIN_DIR/paymock" >"$OUT/paymock.log" 2>&1 & PIDS+=($!)
 wait_for http://localhost:8081/charges paymock
-"$BIN_DIR/api" >"$OUT/api.log" 2>&1 & PIDS+=($!)
+UNIT_CACHE_TTL="$UNIT_CACHE_TTL" UNIT_CACHE_TIMEOUT="$UNIT_CACHE_TIMEOUT" "$BIN_DIR/api" >"$OUT/api.log" 2>&1 & PIDS+=($!)
 wait_for http://localhost:8080/healthz api
 "$BIN_DIR/relay" >"$OUT/relay.log" 2>&1 & PIDS+=($!)
 "$BIN_DIR/payments" >"$OUT/payments.log" 2>&1 & PIDS+=($!)
 "$BIN_DIR/notifier" >"$OUT/notifier.log" 2>&1 & PIDS+=($!)
+"$BIN_DIR/cacheinvalidator" >"$OUT/cacheinvalidator.log" 2>&1 & PIDS+=($!)
 sleep 3 # let the consumers join their groups before load starts
 
 echo "==> Warm-up ($WARMUP, discarded)"
@@ -132,6 +145,9 @@ fi
 
 echo "==> Equalising Postgres state"
 psql_loka -q -c 'CHECKPOINT' -c 'ANALYZE' -c 'SELECT pg_stat_statements_reset()' >/dev/null
+# Count only the measured run's cache reads; the warm-up's entries stay cached.
+docker compose exec -T redis redis-cli CONFIG RESETSTAT >/dev/null
+api_log_start=$(wc -l <"$OUT/api.log") # to count only the measured run's fallbacks
 
 seconds() { # 2m -> 120, 90s -> 90
   case "$1" in
@@ -183,6 +199,23 @@ WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'loka')
 ORDER BY total_exec_time DESC
 LIMIT 25;
 SQL
+
+# keyspace_hits/misses count every key read (GET, but also TTL or EXISTS), not
+# SET or DEL. During a run only the API reads, so don't poke Redis by hand.
+{
+  docker compose exec -T redis redis-cli INFO stats
+  docker compose exec -T redis redis-cli INFO keyspace
+} | tr -d '\r' >"$OUT/redis-stats.txt"
+hit_rate=$(awk -F: '
+  $1 == "keyspace_hits"   { h = $2 }
+  $1 == "keyspace_misses" { m = $2 }
+  END {
+    if (h + m == 0) print "n/a (no cache reads)"
+    else printf "%.1f%% (%d hits, %d misses)", 100 * h / (h + m), h, m
+  }' "$OUT/redis-stats.txt")
+# Reads where Redis failed (usually a timeout) and Postgres answered instead.
+fallbacks=$(tail -n +"$((api_log_start + 1))" "$OUT/api.log" | grep -c '"msg":"unit cache unavailable' || true)
+echo "unit cache hit rate: $hit_rate; reads that fell back to postgres: $fallbacks" | tee -a "$OUT/k6.txt"
 
 psql_loka -P pager=off >"$OUT/db-state.txt" <<'SQL'
 SELECT booking_status, count(*) FROM bookings GROUP BY 1 ORDER BY 1;

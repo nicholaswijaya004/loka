@@ -13,3 +13,4 @@ var ErrCorruptIdempotencyRecord = errors.New("idempotency record is missing its 
 var ErrUnexpectedIdempotencyState = errors.New("unexpected idempotency key state")
 var ErrTooManyRetries = errors.New("too many retries when create booking")
 var ErrIllegalTransition = errors.New("illegal booking status transition")
+var ErrCacheMiss = errors.New("cache miss")

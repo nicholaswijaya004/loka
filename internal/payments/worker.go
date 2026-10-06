@@ -216,6 +216,8 @@ func cancel(ctx context.Context, tx *storage.Store, d storage.DuePayment, res *C
 		Version:     booking.CancelledEventVersion,
 		BookingID:   d.BookingID,
 		CustomerID:  d.CustomerID,
+		UnitID:      d.UnitID,
+		Qty:         d.Qty,
 		Reason:      reason,
 		CancelledAt: time.Now().UTC(),
 	})

@@ -22,7 +22,7 @@ import (
 
 const (
 	EventBookingCancelled = "booking.cancelled"
-	CancelledEventVersion = 1
+	CancelledEventVersion = 2
 	ReasonExpired         = "expired"
 )
 
@@ -32,6 +32,8 @@ type CancelledPayload struct {
 	Version     int       `json:"version"`
 	BookingID   uuid.UUID `json:"booking_id"`
 	CustomerID  uuid.UUID `json:"customer_id"`
+	UnitID      uuid.UUID `json:"unit_id,omitempty"`
+	Qty         int       `json:"qty,omitempty"`
 	Reason      string    `json:"reason"`
 	CancelledAt time.Time `json:"cancelled_at"`
 }
@@ -150,6 +152,8 @@ func insertCancelledEvent(ctx context.Context, tx *storage.Store, b storage.Expi
 		Version:     CancelledEventVersion,
 		BookingID:   b.BookingID,
 		CustomerID:  b.CustomerID,
+		UnitID:      b.UnitID,
+		Qty:         b.Qty,
 		Reason:      ReasonExpired,
 		CancelledAt: cancelledAt,
 	})
@@ -161,7 +165,7 @@ func insertCancelledEvent(ctx context.Context, tx *storage.Store, b storage.Expi
 		AggregateID:   b.BookingID,
 		EventType:     EventBookingCancelled,
 		Payload:       payload,
-		TraceContext:  telemetry.Inject(ctx), // ← is this line there?
+		TraceContext:  telemetry.Inject(ctx),
 	})
 }
 
