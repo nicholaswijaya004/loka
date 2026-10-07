@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -26,6 +29,17 @@ type storeAdapter struct {
 	*storage.Store
 }
 
+// poolStats is a pool's counters since it started. loadrun.sh reads them
+// just before and after the measured run and takes the difference.
+type poolStats struct {
+	MaxConns             int32   `json:"max_conns"`
+	AcquireCount         int64   `json:"acquire_count"`
+	EmptyAcquireCount    int64   `json:"empty_acquire_count"`
+	EmptyAcquireWaitMs   float64 `json:"empty_acquire_wait_ms"`
+	CanceledAcquireCount int64   `json:"canceled_acquire_count"`
+	NewConnsCount        int64   `json:"new_conns_count"`
+}
+
 func (a storeAdapter) WithTx(ctx context.Context, fn func(booking.Store) error) error {
 	return a.Store.WithTx(ctx, func(tx *storage.Store) error {
 		return fn(storeAdapter{tx})
@@ -36,6 +50,18 @@ func (a storeAdapter) WithSerializableTx(ctx context.Context, fn func(booking.St
 	return a.Store.WithSerializableTx(ctx, func(tx *storage.Store) error {
 		return fn(storeAdapter{tx})
 	})
+}
+
+func statsOf(p *pgxpool.Pool) poolStats {
+	s := p.Stat()
+	return poolStats{
+		MaxConns:             s.MaxConns(),
+		AcquireCount:         s.AcquireCount(),
+		EmptyAcquireCount:    s.EmptyAcquireCount(),
+		EmptyAcquireWaitMs:   s.EmptyAcquireWaitTime().Seconds() * 1000,
+		CanceledAcquireCount: s.CanceledAcquireCount(),
+		NewConnsCount:        s.NewConnsCount(),
+	}
 }
 
 func main() {
@@ -68,7 +94,12 @@ func main() {
 		logger.Error("bad dsn", "error", err)
 		os.Exit(1)
 	}
-	cfg.MaxConns = 50
+	maxConns, err := strconv.Atoi(envOr("API_DB_MAX_CONNS", "50"))
+	if err != nil || maxConns < 1 {
+		logger.Error("bad API_DB_MAX_CONNS", "value", os.Getenv("API_DB_MAX_CONNS"), "error", err)
+		os.Exit(1)
+	}
+	cfg.MaxConns = int32(maxConns)
 	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	cfg.ConnConfig.RuntimeParams["application_name"] = "loka-api"
 
@@ -119,6 +150,11 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("booking strategy", "strategy", strategy)
+	logger.Info("runtime",
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"write_pool_max_conns", cfg.MaxConns,
+		"read_pool_max_conns", readCfg.MaxConns,
+	)
 
 	opts := []booking.Option{booking.WithReader(storage.NewStore(readPool))}
 
@@ -199,6 +235,16 @@ func main() {
 		}
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte(`{"status":"ready"}`)); err != nil {
+			logger.Error("write failed", "path", r.URL.Path, "error", err)
+		}
+	})
+
+	mux.HandleFunc("GET /debug/pool", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]poolStats{
+			"write": statsOf(pool),
+			"read":  statsOf(readPool),
+		}); err != nil {
 			logger.Error("write failed", "path", r.URL.Path, "error", err)
 		}
 	})
