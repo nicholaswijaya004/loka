@@ -50,6 +50,18 @@ psql_loka() {
   docker compose exec -T postgres psql -U loka -d loka -v ON_ERROR_STOP=1 "$@"
 }
 
+# macOS only: the share of normal CPU speed allowed right now (pmset -g therm).
+# 100 when nothing is recorded, n/a where pmset doesn't exist.
+cpu_speed_limit() {
+  if ! command -v pmset >/dev/null 2>&1; then
+    echo "n/a"
+    return
+  fi
+  pmset -g therm 2>/dev/null | awk -F= '
+    /CPU_Speed_Limit/ { gsub(/[ \t]/, "", $2); v = $2 }
+    END { print (v == "" ? "100" : v) }'
+}
+
 stop_all() {
   local pid
   for pid in "${PIDS[@]+"${PIDS[@]}"}"; do
@@ -92,6 +104,7 @@ if [[ -e "$OUT" ]]; then
   echo "$OUT already exists; pick another RUN or delete it." >&2
   exit 1
 fi
+speed_start=$(cpu_speed_limit)
 mkdir -p "$OUT"
 # What this run was, next to its results.
 {
@@ -101,6 +114,7 @@ mkdir -p "$OUT"
   echo "unit_rate=${UNIT_RATE:-200}"
   echo "api_db_max_conns=$API_DB_MAX_CONNS gomaxprocs_api=${GOMAXPROCS_API:-default}"
   echo "warmup=$WARMUP duration=$DURATION paymock_latency_ms=$PAYMOCK_LATENCY_MS"
+  echo "cpu_speed_limit_start=$speed_start"
 } >"$OUT/settings.txt"
 
 if [[ "$BUILD" == 1 ]]; then
@@ -262,6 +276,10 @@ read -r lag_n lag_p50 lag_p95 lag_p99 lag_max lag_unpub <<< "$(psql_loka -tA -F'
   FROM outbox_events
   WHERE created_at >= '$measure_start'")"
 echo "outbox lag (ms): p50 $lag_p50 p95 $lag_p95 p99 $lag_p99 max $lag_max over $lag_n events ($lag_unpub unpublished)" | tee -a "$OUT/k6.txt"
+
+speed_end=$(cpu_speed_limit)
+echo "cpu_speed_limit_end=$speed_end" >>"$OUT/settings.txt"
+echo "cpu speed limit: ${speed_start}% at start, ${speed_end}% at end (below 100 = throttled)" | tee -a "$OUT/k6.txt"
 
 psql_loka -P pager=off >"$OUT/db-state.txt" <<'SQL'
 SELECT booking_status, count(*) FROM bookings GROUP BY 1 ORDER BY 1;
