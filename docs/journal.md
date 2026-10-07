@@ -1930,3 +1930,121 @@ the new fields zero.
 - The exact hit-rate model; Redis spans in traces
 - A Redis-only invalidator loop; a circuit breaker; rate-limited warnings
 - The same comparison on Linux / native Docker
+
+## Day 26
+
+### What I built
+
+- **The relay sends a whole batch to Kafka at once** instead of one event at
+  a time, and a failure no longer stops the batch.
+- **`published_at` is stamped with `clock_timestamp()`**, so it says when
+  the event was really marked.
+- **A configurable API write pool and a `/debug/pool` endpoint**, plus a
+  drain test for the relay and pool / lag / CPU lines in every load run.
+- **Who wrote what:** I wrote `clock_timestamp()`, `RunOnce` in three
+  phases, `KafkaPublisher.Publish`, and the pool env var, runtime log and
+  `/debug/pool` (after review fixes). Claude wrote the tests, both scripts
+  and the old-relay build.
+
+### Prediction before measuring
+
+- Drain before batching: I wrote 2–4 events/s (a seconds/milliseconds
+  slip); the formula gave 107–240. **Measured 346–449.**
+- Drain after: no number from me; Claude 2,000–4,500. **Measured
+  4,278–4,839.** Speed-up predicted ~19×, measured **13×**.
+- After batching I said Kafka would still dominate; Claude said Postgres's
+  round trips. Neither was measured: per-batch time is more than round trips.
+- Outbox lag with batching: **I said 10–20 ms. Measured ~300 ms** (p50):
+  wrong by 15×, because the poll wait doesn't change.
+- Write pool smaller → "gradually slower". **Wrong:** p50 flat from 50 to 2;
+  only 2 got worse, in the tail, and collapsed when the machine was slow.
+  Claude said "flat to 5, cliff at 2, p50 jumps": shape right, p50 wrong.
+- GOMAXPROCS 2: "p50 same, p99 same or slower". **No effect shown.**
+- Confirmation runs: **not written.**
+
+### What happened
+
+- Drain test: **358 → 4,660 events/s**, no overlap.
+- Lag under load: p50 766 → 303 ms, p99 2,630 → 579 ms.
+- Halfway through the main sequence every arm slowed down; the restart
+  didn't help, and `pmset` showed the CPU limited to **~20%** of its speed.
+- Pool 2 collapsed every time the machine was throttled; pool 50 never did.
+  Reads kept working through it, on their own pool.
+
+### What I understand now
+
+**Batching turns a per-item cost into a per-batch cost.** 100 sends became
+one. After that the batch size is the lever, because the remaining cost is
+per batch.
+
+**A metric can hide the very cost you're measuring.** `now()` is the
+transaction's start, so every event in a batch got the same timestamp from
+before any of it was sent. `clock_timestamp()` is the real time.
+
+**Throughput and latency are different questions.** Batching made the relay
+13× faster but lag only 2.5× lower: most of the lag is waiting for the next
+poll. Lowering that needs LISTEN/NOTIFY, not more batching.
+
+**A slow worker makes its own queue longer.** Slower sends → a longer cycle
+→ a bigger batch → even slower sends.
+
+**Little's law: busy = arrival rate × time held.** It tells you how many
+connections are in use, not how many seconds. A pool only matters when it's
+close to that number, and the number grows when the machine slows down. A
+pool has to fit the slow case.
+
+**A bulkhead helps when the bottleneck is behind it.** The read pool did
+nothing on Day 24 (the database froze); today it kept reads alive while the
+write pool collapsed.
+
+**GOMAXPROCS is about CPU, not connections.** A goroutine waiting for
+Postgres uses no thread. The API needs under one core here, so 2 vs 16
+made no difference. It matters in containers with CPU limits.
+
+**Check the machine before blaming the code.** `CPU_Speed_Limit 20` explains
+an hour of confusing runs, and Day 24's drift.
+
+**Check the error first.** On error, the other return values mean nothing.
+
+**Measure a component alone when you can.** The drain test gave a clean 13×
+in 7 minutes; the full-stack runs gave mostly overlap.
+
+### Things that went wrong
+
+- Units again: ms × per-second, three times (Little's law, the drain rate,
+  CPU cores).
+- My first `RunOnce` checked `len(events)` before `err` (a swallowed fetch
+  error), then a missing `continue` marked failed events as published. The
+  tests caught both.
+- `newRecord(ctx, …)` instead of `m.Ctx`, `fmt.Sprintf("%+v")` instead of
+  JSON, a TODO left in, and implementation before the tests.
+- Predictions for the confirmation runs not written.
+- Claude's mistakes:
+  - pointing me at terminal output I can't see;
+  - 263 instead of 203 connections;
+  - a fetch-failure test that passed by luck;
+  - a Kafka test that didn't check each record's `traceparent`;
+  - nearly comparing lag with an old relay that still used `now()`;
+  - assuming 4–9 ms round trips and a 40 ms connection hold;
+  - not checking the thermal state before the long sequence, although it
+    was on Day 24's Open list.
+
+### Questions I should be able to answer
+
+- Why 13× and not 19×?
+- What does `now()` return in a transaction, and why did it matter here?
+- Why did lag fall 2.5× when throughput rose 13×?
+- Why mark every success on a partial failure, and what does that give up?
+- Why must `ProduceSync`'s results be matched by `*Record`?
+- Little's law for the write pool: why did pool 2 survive healthy and
+  collapse throttled?
+- When does a separate read pool help, and when doesn't it?
+- What does GOMAXPROCS control, and when does it matter?
+- Why measure the relay with a drain test instead of the full stack?
+
+### Still open
+
+- LISTEN/NOTIFY; a relay CPU profile; batch size 1,000
+- Poison rows and events (attempt cap, dead letter); per-booking order
+- Pools for 3 replicas; GOMAXPROCS in containers
+- Measuring on a cool Mac or on Linux

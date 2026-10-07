@@ -1697,3 +1697,155 @@ With the cache off, the read path's calls equal the `GET /units` count
   entries
 - Per-unit TTL, negative caching, CDC as an invalidation source
 - The same comparison on Linux / native Docker
+
+## Day 26
+
+**Goal:** Batch the outbox relay, tune the API's connection pool, try
+GOMAXPROCS, and record each change's effect separately: change → p99
+before → p99 after → throughput delta.
+
+**Settings:**
+
+| Setting       | Value                                                                                                               | Why                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| drain test    | 20,000 unpublished rows, only Postgres + Kafka + the relay running; Postgres times the drain (PL/pgSQL loop, 50 ms) | the relay's own maximum rate, without HTTP, k6 or consumers in the way |
+| load runs     | Day 25's load at `UNIT_RATE=100` (175 req/s), 15 s warm-up, 2 min measured                                          | the load this Mac sustains                                             |
+| outbox lag    | `published_at − created_at` for events created in the measured window; `published_at = clock_timestamp()`           | `now()` is the transaction's start and hid the sequential sends        |
+| pool counters | `GET /debug/pool` before and after the measured window (`pgxpool.Stat`)                                             | the difference is the window alone                                     |
+| arms          | `API_DB_MAX_CONNS` 50/10/5/2, `GOMAXPROCS` default (16)/2, relay old/new; same binaries otherwise                   | one change at a time                                                   |
+| old relay     | `main`'s relay code + the `clock_timestamp()` fix (`bin/relay-old-clock`)                                           | differs from the new one only in batching                              |
+| valid run     | 0 failed, 0 dropped; pool 2 exempt (drops are the result there)                                                     | decided before the runs                                                |
+| improvement   | only if the worst run of one arm beats the best run of the other                                                    | p99 is noisy                                                           |
+
+**Built:**
+
+- **Relay batching**: one `ProduceSync` per batch instead of one per event.
+  `Publisher.Publish(ctx, []Message) []error` returns one result per message;
+  `KafkaPublisher` maps franz-go's results back by `*Record` (they come back
+  in completion order). Each message keeps its own publish span and
+  `traceparent`.
+- **Partial failure**: every acknowledged event is marked, each failed one
+  gets its own error and attempt; no more stop-at-first-failure. A poison
+  event no longer blocks the outbox. **Behaviour change:** per-booking order
+  is no longer kept when a batch partly fails (today's consumers don't
+  depend on it; a batched send couldn't keep it anyway).
+- **`published_at = clock_timestamp()`** instead of `now()`.
+- **API**: `API_DB_MAX_CONNS` (write pool, default 50); startup log of
+  GOMAXPROCS and pool sizes; `GET /debug/pool` (both pools' `pgxpool.Stat`
+  counters).
+- **Tooling**: `scripts/draintest.sh`; `loadrun.sh` passes
+  `API_DB_MAX_CONNS` / `GOMAXPROCS_API`, prints the write pool's waits, the
+  outbox lag and the CPU speed limit.
+
+**Tests added:**
+
+| Package             | Proves                                                                                                                                                                                                                                                     | Result           |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| relay (unit)        | `KafkaPublisher` against an in-process Kafka (`kfake`): every record arrives with its own `traceparent`; each result lands on its own message although results return in completion order                                                                  | ✓ 2              |
+| relay (integration) | one call per batch; one failure doesn't hold back the others; only the failed event is retried; all fail → all recorded; wrong result count → error, nothing marked; an undecodable row is an error, not an empty batch; each message carries its own span | ✓ 7 (2 replaced) |
+
+All 18 relay tests with `-race`. Checked against broken code: one call per
+event, stop at first failure, results in completion order, the batch's
+context for every record, no result-count check, shared span, failure not
+recorded, failed events marked published, `len(events) == 0` checked before
+`err`. Not tested: `API_DB_MAX_CONNS` and `/debug/pool` (checked by hand).
+
+**Drain test: 20,000 events, alternated** (events/s):
+
+| Run    | 1     | 2     | 3     | Median    | Drain time  |
+| ------ | ----- | ----- | ----- | --------- | ----------- |
+| before | 346   | 449   | 358   | **358**   | 44.6–57.8 s |
+| after  | 4,839 | 4,660 | 4,278 | **4,660** | 4.1–4.7 s   |
+
+Burn-in (after, discarded): 1,892. No overlap: **13×**. All runs: 20,000
+published, 20,000 in Kafka, 0 failed attempts. Implied round trip in the
+quiet drain: ~2.7 ms (100 events ÷ 358/s ÷ 104 round trips). After: ~21 ms
+per batch, more than ~5.5 round trips explain (startup and per-batch CPU,
+not measured).
+
+**Load runs, main sequence** (ms; order: round 1 top to bottom, round 2
+reversed):
+
+| Run         | POST p50 | p95     | p99       | units p50 | Fail/drop    | Write pool: no idle conn, total wait | Lag p50 | p95     | p99       |
+| ----------- | -------- | ------- | --------- | --------- | ------------ | ------------------------------------ | ------- | ------- | --------- |
+| relay-old-1 | 30.2     | 65      | 798       | 4.6       | 0/0          | 1.4%, 4.5 s                          | **766** | 1,380   | **2,630** |
+| base-1      | 28.2     | 71      | 916       | 4.5       | 0/0          | 1.7%, 2.4 s                          | **303** | 538     | **579**   |
+| pool10-1    | 27.0     | 51      | 709       | 4.3       | 0/0          | 2.0%, 63.6 s                         | 296     | 531     | 565       |
+| pool5-1     | 27.4     | 48      | 425       | 4.2       | 0/0          | 3.8%, 52.6 s                         | 295     | 531     | 558       |
+| pool2-1     | 27.3     | **628** | **1,304** | 4.3       | 0/0          | **18%, 394.6 s**                     | 294     | 532     | 1,097     |
+| procs2-1    | 34.5     | 115     | 388       | 6.4       | 0/0          | 0.1%, 10.6 s                         | 317     | 576     | 684       |
+| procs2-2    | 85.0     | 397     | 1,476     | 9.9       | 0/0          | 3.8%, 64.0 s                         | 402     | 687     | 1,273     |
+| pool2-2     | 37,127   | 60,005  | 60,010    | 40.9      | 1,163/4,317  | 99.1%, 57,431 s                      | 474     | 1,047   | 1,513     |
+| pool5-2     | 30,239   | 60,005  | 60,009    | 213       | 1,140/4,624  | 97%, 58,104 s                        | 645     | 1,637   | 2,551     |
+| pool10-2    | 233      | 749     | 1,221     | 17.1      | 0/0          | 53.7%, 786 s                         | 496     | 837     | 966       |
+| base-2      | 311      | 1,505   | 1,879     | 33.9      | 0/0          | 14.2%, 307 s                         | 700     | 1,568   | 2,060     |
+| relay-old-2 | 10,695   | 54,541  | 60,136    | 6,442     | 1,242/11,783 | 92.5%, 51,843 s                      | 155,387 | 218,196 | 219,514   |
+
+Round 1 healthy (POST p50 27–35 ms); round 2 degraded from ~35 minutes in,
+whatever the arm (base-2: 11× base-1 with identical settings).
+
+**Confirmation runs, after a Docker Desktop restart** (ms):
+
+| Run           | POST p50 | p95    | p99    | units p50 | Fail/drop   | Write pool      | Lag p50 |
+| ------------- | -------- | ------ | ------ | --------- | ----------- | --------------- | ------- |
+| conf-base-1   | 54.6     | 102    | 936    | 6.8       | 0/0         | 1.6%, 10.1 s    | 340     |
+| conf-procs2-1 | 58.5     | 187    | 1,066  | 7.2       | 0/0         | 2.5%, 12.6 s    | 361     |
+| conf-pool2-1  | 21,643   | 37,315 | 38,311 | 13.3      | 2,010/3,072 | 99.5%, 59,255 s | 387     |
+| conf-pool2-2  | 22,130   | 38,423 | 38,970 | 13.5      | 2,176/3,109 | 99.5%, 60,720 s | 402     |
+| conf-procs2-2 | 66.4     | 178    | 1,169  | 8.0       | 0/0         | 2.3%, 17.8 s    | 361     |
+| conf-base-2   | 78.6     | 777    | 1,490  | 9.7       | 0/0         | 5.8%, 96.4 s    | 411     |
+
+`pmset -g therm`: **CPU_Speed_Limit 22 before, 20 after** (the CPU allowed
+~20% of its normal speed). Both conf-base runs above the 40 ms degraded
+line set before the runs: the whole set ran throttled.
+
+**The plan's table:**
+
+| Change                 | p99 before          | p99 after                                | Throughput delta                               |
+| ---------------------- | ------------------- | ---------------------------------------- | ---------------------------------------------- |
+| Relay batching         | outbox lag 2,630 ms | **579 ms** (worst new run 2,060)         | relay **358 → 4,660 events/s (13×)**           |
+| Write pool 50 → 10 / 5 | POST 916 ms         | 709 / 425 ms (n = 1)                     | none (fixed-rate load)                         |
+| Write pool 50 → 2      | POST 916 ms         | 1,304 ms healthy; **collapse throttled** | throttled: 1,431–2,929 POSTs answered of 6,000 |
+| GOMAXPROCS default → 2 | POST 916–1,879 ms   | 388–1,476 ms                             | none shown                                     |
+
+**Observations:**
+
+- **Batching turned a per-event cost into a per-batch cost**: 13×. Less
+  than the ~19× the round-trip count suggests; the rest is startup and
+  per-batch CPU.
+- **Lag fell 2.5× (p50) and 4.5× (p99), but not to tens of ms**: the 500 ms
+  poll is now most of it (p50 ≈ half a cycle). The old relay was worse than
+  modelled because a slower send makes a longer cycle, a bigger batch and a
+  slower send.
+- **Pool size 50 → 5 changed nothing measurable; 2 has no headroom.**
+  Healthy: same p50, tail ×9, 18% of acquires waited (3.3 requests queued
+  on average: total wait ÷ 120 s). Throttled: collapse 3 times out of 3,
+  while pool 50 survived every time. Busy connections = rate × hold time;
+  the hold time grows with a slower CPU, so the cliff moves.
+- **Pool 50 still found no idle connection 1.7% of the time** with no new
+  connections: the stall moments, when all 50 are busy at once.
+- **The read pool kept reads alive while the write pool collapsed**
+  (conf-pool2: 0 unit-read failures, p50 13 ms). Day 24's bulkhead helps
+  when the pool is the bottleneck, not when the database freezes.
+- **GOMAXPROCS 2 vs 16: no effect shown** (n = 3 each; round 1's +6 ms did
+  not repeat). The API needs well under one core at this load.
+- **The Mac throttles its CPU to ~20%** after sustained load. That explains
+  round 2 and probably Day 24's drift. Runs now record it.
+- **A POST takes the write pool 4 times** (counted with `/debug/pool`).
+- Unexplained: the old relay's correctness check drained 2,000 events at
+  111 events/s (vs 346–449 at 20,000).
+
+**Open:**
+
+- LISTEN/NOTIFY for the relay (and worker): the poll is now most of the lag
+- A CPU profile of the relay during a drain: what fills the ~21 ms per batch
+- Batch size 1,000 (an env var): the cost is per batch now
+- A poison **row** (undecodable) still fails every fetch and blocks the
+  outbox; an attempt cap / dead-letter for poison events
+- A per-booking sequence number for any consumer that needs order
+- Pools × 3 API replicas (Day 38): ~203 connections against
+  `max_connections` 100 → smaller pools or PgBouncer
+- GOMAXPROCS under a container CPU limit (Days 36–37)
+- Measurements on a cooled / plugged-in Mac, or Linux; Docker Desktop's
+  memory as a second suspect
+- Throughput at saturation (Days 34–35); `/debug/pool` → Prometheus (Day 33)
