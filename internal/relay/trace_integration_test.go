@@ -68,14 +68,17 @@ type ctxPublisher struct {
 	ctxs   map[int64]context.Context
 }
 
-func (p *ctxPublisher) Publish(ctx context.Context, e storage.Outbox) error {
+func (p *ctxPublisher) Publish(_ context.Context, msgs []Message) []error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.ctxs[e.ID] = ctx
-	if p.failOn[e.ID] {
-		return errInjectedPublish
+	errs := make([]error, len(msgs))
+	for i, m := range msgs {
+		p.ctxs[m.Event.ID] = m.Ctx
+		if p.failOn[m.Event.ID] {
+			errs[i] = errInjectedPublish
+		}
 	}
-	return nil
+	return errs
 }
 
 // publishSpan returns the one ended span of the given trace, failing if the
@@ -169,5 +172,33 @@ func TestRunOnceWithoutStoredTraceStillPublishes(t *testing.T) {
 	}
 	if sc := trace.SpanContextFromContext(pub.ctxs[ids[0]]); !sc.IsValid() {
 		t.Error("publisher got no span: want a new root span for an untraced event")
+	}
+}
+
+// Two bookings in one batch: each message carries its own booking's publish
+// span, and only the failed one's span is an error.
+func TestRunOnceGivesEachMessageItsOwnSpan(t *testing.T) {
+	testdb.Reset(t, testPool)
+	spanRecorder()
+	okParent, failParent := apiSpan(t), apiSpan(t)
+	okID := insertTracedEvent(t, okParent)
+	failID := insertTracedEvent(t, failParent)
+
+	pub := &ctxPublisher{ctxs: map[int64]context.Context{}, failOn: map[int64]bool{failID: true}}
+	if _, err := New(storage.NewStore(testPool), pub, 10, 0, testLogger).RunOnce(context.Background()); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+
+	okSpan, failSpan := publishSpan(t, okParent.TraceID()), publishSpan(t, failParent.TraceID())
+	for id, span := range map[int64]sdktrace.ReadOnlySpan{okID: okSpan, failID: failSpan} {
+		if got := trace.SpanContextFromContext(pub.ctxs[id]); got.SpanID() != span.SpanContext().SpanID() {
+			t.Errorf("event %d: message carries span %s, want its own publish span %s", id, got.SpanID(), span.SpanContext().SpanID())
+		}
+	}
+	if okSpan.Status().Code == codes.Error {
+		t.Error("the successful event's span is an error")
+	}
+	if failSpan.Status().Code != codes.Error {
+		t.Errorf("the failed event's span: got %s, want error", failSpan.Status().Code)
 	}
 }

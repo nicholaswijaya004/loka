@@ -18,8 +18,18 @@ func NewKafkaPublisher(client *kgo.Client, topic string) *KafkaPublisher {
 	return &KafkaPublisher{client: client, topic: topic}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, e storage.Outbox) error {
-	return p.client.ProduceSync(ctx, newRecord(ctx, p.topic, e)).FirstErr()
+func (p *KafkaPublisher) Publish(ctx context.Context, msgs []Message) []error {
+	records := make([]*kgo.Record, len(msgs))
+	index := make(map[*kgo.Record]int, len(msgs))
+	for i, m := range msgs {
+		records[i] = newRecord(m.Ctx, p.topic, m.Event)
+		index[records[i]] = i
+	}
+	errs := make([]error, len(msgs))
+	for _, res := range p.client.ProduceSync(ctx, records...) {
+		errs[index[res.Record]] = res.Err
+	}
+	return errs
 }
 
 // newRecord builds the Kafka record for an outbox event. Its headers carry
