@@ -16,8 +16,17 @@ import (
 
 var tracer = otel.Tracer("github.com/nicholaswijaya004/loka/internal/relay")
 
+// Message is one outbox event and the context of its publish span; its Kafka
+// headers point at that span.
+type Message struct {
+	Ctx   context.Context
+	Event storage.Outbox
+}
+
+// Publisher sends a batch at once. It returns one error per message, in the
+// same order as msgs; nil means Kafka acknowledged that message.
 type Publisher interface {
-	Publish(ctx context.Context, e storage.Outbox) error
+	Publish(ctx context.Context, msgs []Message) []error
 }
 
 type Relay struct {
@@ -41,9 +50,13 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		if err != nil {
 			return err
 		}
+		if len(events) == 0 {
+			return nil
+		}
 
-		sent := make([]int64, 0, len(events))
-		for _, e := range events {
+		msgs := make([]Message, len(events))
+		spans := make([]trace.Span, len(events))
+		for i, e := range events {
 			// Continue the booking's trace from the outbox row; the span is the
 			// parent of the consumer's, via the Kafka headers Publish writes.
 			pctx, span := tracer.Start(telemetry.Extract(ctx, e.TraceContext), "publish "+e.EventType,
@@ -54,21 +67,32 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 					attribute.String("booking.id", e.AggregateID.String()),
 				),
 			)
-			err := r.publisher.Publish(pctx, e)
-			if err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, "publish failed")
-			}
-			span.End()
+			msgs[i], spans[i] = Message{Ctx: pctx, Event: e}, span
+		}
 
+		defer func() {
+			for _, span := range spans {
+				span.End()
+			}
+		}()
+
+		errs := r.publisher.Publish(ctx, msgs)
+		if len(errs) != len(msgs) {
+			return fmt.Errorf("publisher returned %d errors for %d messages", len(errs), len(msgs))
+		}
+
+		sent := make([]int64, 0, len(events))
+		for i, err := range errs {
 			if err != nil {
-				r.logger.Warn("publish failed", "event_id", e.ID, "error", err)
-				if err := tx.RecordOutboxFailure(ctx, e.ID, err.Error()); err != nil {
+				spans[i].RecordError(err)
+				spans[i].SetStatus(codes.Error, "publish failed")
+				r.logger.Warn("failed to publish outbox event", "event_id", events[i].ID, "error", err)
+				if err := tx.RecordOutboxFailure(ctx, events[i].ID, err.Error()); err != nil {
 					return err
 				}
-				break
+				continue
 			}
-			sent = append(sent, e.ID)
+			sent = append(sent, events[i].ID)
 		}
 
 		if r.afterPublish != nil && len(sent) > 0 {

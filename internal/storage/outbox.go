@@ -73,7 +73,7 @@ func (s *Store) MarkOutboxEventsPublished(ctx context.Context, ids []int64) erro
 
 	tag, err := s.db.Exec(ctx, `
 		UPDATE outbox_events
-		SET published_at = now()
+		SET published_at = clock_timestamp()
 		WHERE id = ANY($1) AND published_at IS NULL
 	`, ids)
 	if err != nil {

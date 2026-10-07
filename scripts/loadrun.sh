@@ -5,7 +5,8 @@
 #   build -> make reset -> load seed -> start all six binaries -> warm-up
 #   (discarded) -> CHECKPOINT + ANALYZE + reset pg_stat_statements and the
 #   Redis counters -> measured k6 run -> dump pg_stat_statements, the Redis
-#   hit rate and pipeline state -> stop.
+#   hit rate, the API write pool's waits, the outbox lag and pipeline state
+#   -> stop.
 #
 # Containers stay up afterwards, so Jaeger keeps this run's traces until the
 # next reset.
@@ -15,13 +16,16 @@
 #   LABEL=after  RUN=1 BUILD=0 ./scripts/loadrun.sh   # reuse bin/after
 #   LABEL=diag   RUN=1 BUILD=0 BIN_DIR=bin/before MONITOR=1 ./scripts/loadrun.sh
 #   LABEL=nocache RUN=1 UNIT_CACHE_TTL=0 ./scripts/loadrun.sh   # cache off
+#   LABEL=pool5   RUN=1 API_DB_MAX_CONNS=5 ./scripts/loadrun.sh  # API write pool of 5
+#   LABEL=procs2  RUN=1 GOMAXPROCS_API=2 ./scripts/loadrun.sh    # the API on 2 threads
 #
 # MONITOR=1 adds docker-stats.txt and probe.log: a pgbench client inside the
 # Postgres container running SELECT 1 at 20/s over the local socket. It adds
 # load of its own, so a monitored run is for diagnosis, never a measurement.
 #
 # Output: loadruns/<LABEL>-<RUN>/ (settings.txt, k6.txt, k6-summary.json,
-# pg_stat_statements.txt, redis-stats.txt, db-state.txt, one log per binary).
+# pg_stat_statements.txt, redis-stats.txt, pool-before.json, pool-after.json,
+# db-state.txt, one log per binary).
 
 set -euo pipefail
 
@@ -35,6 +39,8 @@ PAYMOCK_LATENCY_MS="${PAYMOCK_LATENCY_MS:-100}"
 MONITOR="${MONITOR:-0}" # 1 = record docker stats + an in-VM SELECT 1 probe (diagnosis only)
 UNIT_CACHE_TTL="${UNIT_CACHE_TTL:-30s}" # 0 = unit cache off, same binaries
 UNIT_CACHE_TIMEOUT="${UNIT_CACHE_TIMEOUT:-50ms}" # Redis read/write timeout in the API
+API_DB_MAX_CONNS="${API_DB_MAX_CONNS:-50}"       # API write pool size
+GOMAXPROCS_API="${GOMAXPROCS_API:-}"             # threads running Go code in the API; empty = all CPUs
 OUT="loadruns/${LABEL}-${RUN}"
 BINARIES=(paymock api relay payments notifier cacheinvalidator)
 
@@ -42,6 +48,18 @@ PIDS=()
 
 psql_loka() {
   docker compose exec -T postgres psql -U loka -d loka -v ON_ERROR_STOP=1 "$@"
+}
+
+# macOS only: the share of normal CPU speed allowed right now (pmset -g therm).
+# 100 when nothing is recorded, n/a where pmset doesn't exist.
+cpu_speed_limit() {
+  if ! command -v pmset >/dev/null 2>&1; then
+    echo "n/a"
+    return
+  fi
+  pmset -g therm 2>/dev/null | awk -F= '
+    /CPU_Speed_Limit/ { gsub(/[ \t]/, "", $2); v = $2 }
+    END { print (v == "" ? "100" : v) }'
 }
 
 stop_all() {
@@ -86,6 +104,7 @@ if [[ -e "$OUT" ]]; then
   echo "$OUT already exists; pick another RUN or delete it." >&2
   exit 1
 fi
+speed_start=$(cpu_speed_limit)
 mkdir -p "$OUT"
 # What this run was, next to its results.
 {
@@ -93,7 +112,9 @@ mkdir -p "$OUT"
   echo "bin_dir=$BIN_DIR"
   echo "unit_cache_ttl=$UNIT_CACHE_TTL unit_cache_timeout=$UNIT_CACHE_TIMEOUT"
   echo "unit_rate=${UNIT_RATE:-200}"
+  echo "api_db_max_conns=$API_DB_MAX_CONNS gomaxprocs_api=${GOMAXPROCS_API:-default}"
   echo "warmup=$WARMUP duration=$DURATION paymock_latency_ms=$PAYMOCK_LATENCY_MS"
+  echo "cpu_speed_limit_start=$speed_start"
 } >"$OUT/settings.txt"
 
 if [[ "$BUILD" == 1 ]]; then
@@ -124,7 +145,13 @@ fi
 echo "==> Starting binaries"
 LATENCY_MS="$PAYMOCK_LATENCY_MS" "$BIN_DIR/paymock" >"$OUT/paymock.log" 2>&1 & PIDS+=($!)
 wait_for http://localhost:8081/charges paymock
-UNIT_CACHE_TTL="$UNIT_CACHE_TTL" UNIT_CACHE_TIMEOUT="$UNIT_CACHE_TIMEOUT" "$BIN_DIR/api" >"$OUT/api.log" 2>&1 & PIDS+=($!)
+# GOMAXPROCS is only set when asked for: Go treats an empty value as unset,
+# but leaving it out says so plainly.
+api_env=(UNIT_CACHE_TTL="$UNIT_CACHE_TTL" UNIT_CACHE_TIMEOUT="$UNIT_CACHE_TIMEOUT" API_DB_MAX_CONNS="$API_DB_MAX_CONNS")
+if [[ -n "$GOMAXPROCS_API" ]]; then
+  api_env+=(GOMAXPROCS="$GOMAXPROCS_API")
+fi
+env "${api_env[@]}" "$BIN_DIR/api" >"$OUT/api.log" 2>&1 & PIDS+=($!)
 wait_for http://localhost:8080/healthz api
 "$BIN_DIR/relay" >"$OUT/relay.log" 2>&1 & PIDS+=($!)
 "$BIN_DIR/payments" >"$OUT/payments.log" 2>&1 & PIDS+=($!)
@@ -174,10 +201,16 @@ if [[ "$MONITOR" == 1 ]]; then
   PROBE_PID=$!
 fi
 
+# The pool's counters are cumulative since the API started; the difference
+# between these two snapshots is the measured window alone.
+curl -sf localhost:8080/debug/pool >"$OUT/pool-before.json"
+measure_start=$(psql_loka -tA -c "SELECT clock_timestamp()")
+
 echo "==> Measured run ($DURATION)"
 k6_status=0
 k6 run -q -e DURATION="$DURATION" -e SUMMARY_FILE="$OUT/k6-summary.json" scripts/k6/load.js \
   2>&1 | tee "$OUT/k6.txt" || k6_status=$?
+curl -sf localhost:8080/debug/pool >"$OUT/pool-after.json"
 
 if [[ "$MONITOR" == 1 ]]; then
   wait "$PROBE_PID" || true
@@ -216,6 +249,37 @@ hit_rate=$(awk -F: '
 # Reads where Redis failed (usually a timeout) and Postgres answered instead.
 fallbacks=$(tail -n +"$((api_log_start + 1))" "$OUT/api.log" | grep -c '"msg":"unit cache unavailable' || true)
 echo "unit cache hit rate: $hit_rate; reads that fell back to postgres: $fallbacks" | tee -a "$OUT/k6.txt"
+
+# Write pool in the measured window. "No idle connection" covers both waiting
+# for a busy one and opening a new one; new_conns separates the two.
+jq -rn --slurpfile a "$OUT/pool-before.json" --slurpfile b "$OUT/pool-after.json" '
+  ($a[0].write) as $x | ($b[0].write) as $y |
+  ($y.acquire_count - $x.acquire_count)                          as $acq   |
+  ($y.empty_acquire_count - $x.empty_acquire_count)              as $empty |
+  (($y.new_conns_count // 0) - ($x.new_conns_count // 0))        as $new   |
+  ($y.empty_acquire_wait_ms - $x.empty_acquire_wait_ms)          as $wait  |
+  ($y.canceled_acquire_count - $x.canceled_acquire_count)        as $cancel |
+  "write pool \($y.max_conns): \($acq) acquires, \($empty) found no idle connection " +
+  "(\(if $acq > 0 then ($empty * 1000 / $acq | floor) / 10 else 0 end)%, \($new) of them opened a new one), " +
+  "\($wait | floor) ms waiting in total, \($cancel) canceled"' | tee -a "$OUT/k6.txt"
+
+# Outbox lag for the events created in the measured window (a window owns what
+# it created). Two seconds first, so the relay publishes the last second's.
+sleep 2
+read -r lag_n lag_p50 lag_p95 lag_p99 lag_max lag_unpub <<< "$(psql_loka -tA -F' ' -c "
+  SELECT count(*) FILTER (WHERE published_at IS NOT NULL),
+         round((percentile_cont(0.50) WITHIN GROUP (ORDER BY extract(epoch FROM published_at - created_at) * 1000))::numeric, 1),
+         round((percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM published_at - created_at) * 1000))::numeric, 1),
+         round((percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch FROM published_at - created_at) * 1000))::numeric, 1),
+         round(max(extract(epoch FROM published_at - created_at) * 1000)::numeric, 1),
+         count(*) FILTER (WHERE published_at IS NULL)
+  FROM outbox_events
+  WHERE created_at >= '$measure_start'")"
+echo "outbox lag (ms): p50 $lag_p50 p95 $lag_p95 p99 $lag_p99 max $lag_max over $lag_n events ($lag_unpub unpublished)" | tee -a "$OUT/k6.txt"
+
+speed_end=$(cpu_speed_limit)
+echo "cpu_speed_limit_end=$speed_end" >>"$OUT/settings.txt"
+echo "cpu speed limit: ${speed_start}% at start, ${speed_end}% at end (below 100 = throttled)" | tee -a "$OUT/k6.txt"
 
 psql_loka -P pager=off >"$OUT/db-state.txt" <<'SQL'
 SELECT booking_status, count(*) FROM bookings GROUP BY 1 ORDER BY 1;
