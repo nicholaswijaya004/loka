@@ -2224,3 +2224,77 @@ worker count both sides; past that it closes connections silently.
 ### Still open
 
 - Replicated workers; PgBouncer; latency with replicas, n ≥ 3; k8s + HPA
+
+## Day 30
+
+### What I built
+
+- **The API on Kubernetes (kind)**: Deployment with readiness and liveness
+  probes, CPU/memory requests and limits, a Service, and a CPU HPA capped
+  at 3 replicas.
+- **An in-cluster k6 Job** for the HPA demo.
+- **Who wrote what:** Claude wrote the manifests and the load script and
+  validated them; I got a cluster running (Docker Desktop's didn't start;
+  kind did), installed metrics-server, and ran the demo.
+
+### Prediction before measuring
+
+- Pods and time to scale up; time to scale down: **not written.**
+- Claude: capped at 3 (formula above 8); `GOMAXPROCS` 1 at a 500m limit,
+  **wrong: 2** (Go rounds a limit below 2 up to 2).
+
+### What happened
+
+- 1 → 3 pods in one step, about a minute after the Job was created (image
+  pull included); new pods Ready in 5 s.
+- The HPA wanted ~30 pods and was held at 3.
+- 3 pods couldn't serve 400 req/s: 3.3% dropped, p99 2.87 s.
+- The kernel counted 93.7 s of throttling on the first pod.
+- Back to 1 pod 5 minutes after the load ended, in two steps.
+
+### What I understand now
+
+**Readiness and liveness answer different questions.** Ready = send me
+traffic (depends on the database). Alive = don't restart me (must not depend
+on the database, or one Postgres outage restarts every pod).
+
+**HPA percentages are of the request, not the limit.** 498% meant each pod
+used almost 5× what it asked for, up to its 500m limit.
+
+**The autoscaler has a ceiling the database sets.** Each pod opens up to 30
+connections; Postgres allows 100. Past 3 pods, more pods would mean
+connection errors, not capacity.
+
+**A CPU limit trades latency for isolation.** When a pod spends its 50 ms of
+each 100 ms, it waits for the next period; at load, that turns a 7 ms
+median into a 3 s p99.
+
+**Scale-down is slow on purpose.** The highest recommendation of the last
+5 minutes wins, so a short dip doesn't remove pods.
+
+**Load balancing is per connection at L4.** kube-proxy picks a pod per
+connection; with keep-alive, new pods get nothing. Port-forward is worse:
+one pod.
+
+### Things that went wrong
+
+- Docker Desktop's built-in Kubernetes never answered; switched to kind.
+- `brew install kubectl` started compiling CMake: 31 minutes lost before
+  downloading the binary instead.
+- No predictions written for the demo.
+- Claude's mistake: `GOMAXPROCS` 1 at a 500m limit; Go's source says 2.
+
+### Questions I should be able to answer
+
+- Readiness vs liveness: what does each check here, and why?
+- How does the HPA compute the replica count, and why did it stop at 3?
+- Why was p99 2.87 s when the median was 6.78 ms?
+- Why did scale-down take 5 minutes and happen in two steps?
+- What does GOMAXPROCS become under a 500m limit, and why?
+- Why run k6 inside the cluster instead of through port-forward?
+- What would you change to serve 400 req/s here?
+
+### Still open
+
+- Requests without limits; scaling on backlog or p99; PgBouncer; workers on
+  Kubernetes

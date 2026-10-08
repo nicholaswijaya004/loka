@@ -1,0 +1,23 @@
+# Keeps the pods' average CPU near 50% of their request (50m):
+#   desired = ceil(current replicas x observed / target)
+# checked every 15 s. Scaling down waits for 5 minutes of lower
+# recommendations (the default), so a short dip doesn't remove pods.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: loka-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: loka-api
+  minReplicas: 1
+  # Not more: each replica can open 30 Postgres connections (see api.yaml).
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50

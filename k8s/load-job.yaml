@@ -1,0 +1,31 @@
+# k6 inside the cluster, against the Service, so kube-proxy spreads the
+# requests over the pods. (A `kubectl port-forward` would pin every request
+# to one pod and new pods would sit idle.)
+#
+#   kubectl create configmap loka-k6 --from-file=scripts/k6/hpa.js
+#   kubectl apply -f k8s/load-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loka-hpa-load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:1.2.3
+          args: ["run", "--quiet", "/scripts/hpa.js"]
+          env:
+            - name: BASE_URL
+              value: http://loka-api
+            - name: RATE
+              value: "400"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: loka-k6

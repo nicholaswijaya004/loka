@@ -1,0 +1,78 @@
+# The API on Kubernetes. Postgres, Redis and Jaeger stay in docker compose on
+# the Mac; pods reach them through host.docker.internal.
+#
+# No `replicas:` here on purpose: the HorizontalPodAutoscaler (hpa.yaml) owns
+# the count, and re-applying this file would otherwise reset it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loka-api
+  labels:
+    app: loka-api
+spec:
+  selector:
+    matchLabels:
+      app: loka-api
+  template:
+    metadata:
+      labels:
+        app: loka-api
+    spec:
+      containers:
+        - name: api
+          image: loka-api:dev
+          # Loaded into the cluster with `kind load docker-image`; never pulled.
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: postgres://loka:loka@host.docker.internal:5432/loka?sslmode=disable
+            - name: REDIS_ADDR
+              value: host.docker.internal:6379
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://host.docker.internal:4317
+            # 3 replicas (maxReplicas) x (20 write + 10 read) = 90 of
+            # Postgres's 100 connections: the database caps the autoscaler.
+            - name: API_DB_MAX_CONNS
+              value: "20"
+          resources:
+            # The HPA's percentages are of the request: 50% = 50m.
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            # Above the CPU limit the pod is throttled, above the memory
+            # limit it is killed. Go reads the CPU limit at start:
+            # GOMAXPROCS = max(2, ceil(0.5)) = 2.
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          # Ready = may receive traffic. /readyz pings Postgres, so a pod that
+          # can't reach the database is taken out of the Service.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          # Alive = not stuck. /healthz doesn't touch the database: a Postgres
+          # outage must not restart every pod at once.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loka-api
+spec:
+  selector:
+    app: loka-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
