@@ -2016,3 +2016,78 @@ Day 3, one instance: 1 × 201, 0 replays, 499 × 409.
 - PgBouncer instead of shrinking pools per replica
 - Latency per strategy with replicas vs one instance (same machine, n ≥ 3)
 - k8s manifests + HPA (dropped from the plan for time)
+
+## Day 30
+
+**Goal:** the API on Kubernetes with probes and resource limits, and a
+HorizontalPodAutoscaler scaling it under load (plan Days 36–37).
+
+**Settings:**
+
+| Setting      | Value                                                                                                                 | Why                                                            |
+| ------------ | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| cluster      | kind, node v1.37.0; kubectl v1.37.1; metrics-server v0.8.0 (`--kubelet-insecure-tls`)                                 | Docker Desktop's built-in Kubernetes never answered (API EOF)  |
+| dependencies | Postgres, Redis, Jaeger in compose, reached via `host.docker.internal`                                                | only the API is the subject                                    |
+| pod          | requests 100m / 64Mi, limits 500m / 128Mi; readiness `/readyz` (DB ping), liveness `/healthz`                         | HPA % is of the request; liveness must not depend on Postgres  |
+| pools        | `API_DB_MAX_CONNS=20` + read 10 per pod                                                                               | 3 × 30 = 90 of 100 connections                                 |
+| HPA          | CPU 50% of request, min 1, **max 3**; default behaviour (15 s sync, 5 min scale-down window)                          | the database caps the replica count                            |
+| load         | k6 **inside** the cluster against the Service; `GET /units/{id}`, 30 s ramp to 400/s, 4 min hold; `noConnectionReuse` | kube-proxy balances connections; keep-alive would pin old pods |
+| GOMAXPROCS   | logged **2** (Go 1.26: limit 0.5 CPU → `max(2, ceil(0.5))`)                                                           | read from the pod, not assumed                                 |
+
+**HPA timeline** (`kubectl get hpa -w`, `get pods -w`, events):
+
+| Time           | Observed CPU (avg of pods, % of request) | Replicas | Event                                    |
+| -------------- | ---------------------------------------- | -------- | ---------------------------------------- |
+| 02:25:29       | —                                        | 1        | load Job created (k6 image pulled first) |
+| 02:26:00       | 8%                                       | 1        | load starting                            |
+| 02:26:15       | 387%                                     | 1 → 3    | rescale to 3; 2 pods created             |
+| 02:26:20       | —                                        | 3        | both new pods Ready (5 s after creation) |
+| 02:26:45       | **498%**                                 | 3        | all 3 near their 500m limit              |
+| 02:27–02:30:31 | 238–423%                                 | 3        | `ScalingLimited: TooManyReplicas`        |
+| 02:30:46       | 33%                                      | 3        | load over                                |
+| 02:31:01       | 2%                                       | 3        | `ScaleDownStabilized`                    |
+| 02:35:31       | 2%                                       | 3 → 2    | "All metrics below target"               |
+| 02:35:46       | 2%                                       | 2 → 1    |                                          |
+
+**k6** (in-cluster): 98,791 requests, **366.1 req/s** (target 400), 0 failed;
+median **6.78 ms**, p95 **668 ms**, p99 **2.87 s**, max 3.5 s;
+**dropped 3,357 (3.3%)**, 400 VUs reached.
+
+**CPU throttling** (`/sys/fs/cgroup/cpu.stat`, since pod start):
+
+| Pod               | Periods | Throttled     | Time throttled | CPU used |
+| ----------------- | ------- | ------------- | -------------- | -------- |
+| 2q2bh (first pod) | 2,972   | **687 (23%)** | **93.7 s**     | 96.1 s   |
+| 57tqq             | 2,589   | 356 (14%)     | 32.0 s         | 81.5 s   |
+| pzjj5             | 2,607   | 306 (12%)     | 23.0 s         | 81.0 s   |
+
+**Observations:**
+
+- **Scale-up took one HPA sync after the metric showed the load**, and new
+  pods were Ready in 5 s. The slow part is the metric (metrics-server +
+  HPA's 15 s loop), not the pod.
+- **The cap held:** at 498% on 3 pods the formula asks for
+  `ceil(3 × 498 / 50) = 30`. `maxReplicas: 3`, set by Postgres's 100
+  connections, kept it at 3.
+- **3 pods at their limit could not serve 400 req/s:** 3.3% dropped, p99
+  2.87 s against a 6.78 ms median. By Day 28's rule (dropped > 1%) this
+  capped deployment broke at this load.
+- **The tail is CFS throttling, measured:** the first pod was paused for
+  93.7 s of a ~5 min load (23% of its periods). Requests wait out the rest
+  of each 100 ms period, and queue behind each other.
+- **Kernel time exceeded user time** (52 s vs 44 s on the first pod): a new
+  TCP connection per request (`noConnectionReuse`). The demo overstates
+  per-request CPU (~2.6 ms here: 258.6 s / 98,791) versus keep-alive
+  clients.
+- **Scale-down came 5 min after the load ended, in two steps** (3 → 2 → 1,
+  15 s apart): the HPA takes the highest recommendation of the last 5 min;
+  the 33% sample (→ 2 pods) left the window 15 s after the 238% one (→ 3).
+
+**Open:**
+
+- No CPU limit (requests only) vs a limit: throttling vs noisy neighbours
+- Scaling on a better signal than CPU (outbox backlog age, p99) via a
+  Prometheus adapter or KEDA
+- PgBouncer, so `maxReplicas` isn't set by `max_connections`
+- The workers (relay, payments, consumers) on Kubernetes; Postgres managed
+- Keep-alive load with a request-level balancer (an ingress or service mesh)
