@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: loka
+    folder: Loka
+    type: file
+    # The JSON in the repo is the source of truth: edits made in the UI are
+    # lost on restart unless exported back into monitoring/grafana/dashboards.
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

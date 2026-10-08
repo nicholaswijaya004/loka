@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -30,20 +32,35 @@ type Publisher interface {
 }
 
 type Relay struct {
-	store        *storage.Store
-	publisher    Publisher
-	batchSize    int
-	interval     time.Duration
-	logger       *slog.Logger
-	afterPublish func()
+	store         *storage.Store
+	publisher     Publisher
+	batchSize     int
+	interval      time.Duration
+	logger        *slog.Logger
+	afterPublish  func()
+	meterProvider metric.MeterProvider
+	metrics       *metrics
 }
 
-func New(store *storage.Store, publisher Publisher, batchSize int, interval time.Duration, logger *slog.Logger) *Relay {
-	return &Relay{store: store, publisher: publisher, batchSize: batchSize, interval: interval, logger: logger}
+func New(store *storage.Store, publisher Publisher, batchSize int, interval time.Duration, logger *slog.Logger, opts ...Option) *Relay {
+	r := &Relay{store: store, publisher: publisher, batchSize: batchSize, interval: interval, logger: logger,
+		meterProvider: otel.GetMeterProvider()}
+	for _, opt := range opts {
+		opt(r)
+	}
+	m, err := newMetrics(r.meterProvider)
+	if err != nil {
+		// Publishing matters more than counting it: carry on unmeasured.
+		logger.Error("relay metrics setup failed, running without metrics", "error", err)
+		m, _ = newMetrics(noop.NewMeterProvider())
+	}
+	r.metrics = m
+	return r
 }
 
 func (r *Relay) RunOnce(ctx context.Context) (int, error) {
-	published := 0
+	start := time.Now()
+	published, fetched := 0, 0
 
 	err := r.store.WithTx(ctx, func(tx *storage.Store) error {
 		events, err := tx.FetchUnpublishedOutboxEvents(ctx, r.batchSize)
@@ -53,6 +70,7 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		if len(events) == 0 {
 			return nil
 		}
+		fetched = len(events)
 
 		msgs := make([]Message, len(events))
 		spans := make([]trace.Span, len(events))
@@ -87,6 +105,7 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 				spans[i].RecordError(err)
 				spans[i].SetStatus(codes.Error, "publish failed")
 				r.logger.Warn("failed to publish outbox event", "event_id", events[i].ID, "error", err)
+				r.metrics.failed.Add(ctx, 1)
 				if err := tx.RecordOutboxFailure(ctx, events[i].ID, err.Error()); err != nil {
 					return err
 				}
@@ -105,9 +124,17 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		published = len(sent)
 		return nil
 	})
+	// Empty polls are left out: two a second at about a millisecond each,
+	// they would drag every percentile down to the cost of doing nothing.
+	if fetched > 0 {
+		r.metrics.batch.Record(ctx, time.Since(start).Seconds())
+	}
 	if err != nil {
 		return 0, fmt.Errorf("relay batch: %w", err)
 	}
+	// Counted only now that the batch has committed: a rolled-back batch is
+	// fetched and published again, and would otherwise be counted twice.
+	r.metrics.published.Add(ctx, int64(published))
 	return published, nil
 }
 

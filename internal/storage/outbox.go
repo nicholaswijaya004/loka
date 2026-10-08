@@ -100,3 +100,20 @@ func (s *Store) RecordOutboxFailure(ctx context.Context, id int64, errMsg string
 	}
 	return nil
 }
+
+// OutboxBacklog returns how many events wait to be published and how long
+// the oldest of them has waited (0 when none does). A failing event stays in
+// the backlog, so a stuck one shows as an age that keeps growing.
+func (s *Store) OutboxBacklog(ctx context.Context) (count int64, oldest time.Duration, err error) {
+	var seconds float64
+	err = s.db.QueryRow(ctx, `
+		SELECT count(*),
+		       coalesce(extract(epoch FROM clock_timestamp() - min(created_at)), 0)::float8
+		FROM outbox_events
+		WHERE published_at IS NULL
+	`).Scan(&count, &seconds)
+	if err != nil {
+		return 0, 0, fmt.Errorf("outbox backlog: %w", err)
+	}
+	return count, time.Duration(seconds * float64(time.Second)), nil
+}

@@ -1849,3 +1849,110 @@ line set before the runs: the whole set ran throttled.
 - Measurements on a cooled / plugged-in Mac, or Linux; Docker Desktop's
   memory as a second suspect
 - Throughput at saturation (Days 34–35); `/debug/pool` → Prometheus (Day 33)
+
+## Day 27
+
+**Goal:** Prometheus + Grafana dashboard for the four golden signals
+(traffic, latency, errors, saturation) of the API and the outbox pipeline,
+and a check of the dashboard's p99 against k6's.
+
+**Machine change (from today on):** Docker Desktop VM memory **1.94 → 3.84
+GiB** (Docker 20.10.12, Compose v2.2.3, Intel Mac). Runs from Day 27 on are
+not compared with Days 24–26 unless rerun on this setup. Docker Desktop
+stopped twice after the resize (engine down, compose containers gone).
+
+**Settings:**
+
+| Setting      | Value                                                                                                             | Why                                                                  |
+| ------------ | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| collection   | pull: Prometheus 3.5.0 scrapes `:8080/metrics` (API) and `:9101/metrics` (relay) every 5 s                        | a dead process shows as `up == 0`; 5 s gives `rate()` enough samples |
+| monitoring   | own compose project (`make monitoring-up`); Grafana 12.1.0, dashboard provisioned from JSON                       | `make reset` (`down -v`) would wipe the history on every load run    |
+| HTTP latency | otelhttp's `http.server.request.duration`, buckets 5, 10, 25, 50, 75, 100, 250, 500, 750 ms, 1, 2.5, 5, 7.5, 10 s | the library default, read from `/metrics`, not assumed               |
+| labels       | route pattern (`/bookings/{id}`), method, status code                                                             | bounded: a raw path is one series per booking                        |
+| comparison   | `histogram_quantile` over `increase(...[window])`, window = measured run + 5 s                                    | same requests as k6's table, plus k6's 200 setup POSTs               |
+| valid run    | 0 failed, 0 dropped (Day 26's rule)                                                                               | decided before                                                       |
+
+**Built:**
+
+- `/metrics` on the API: otelhttp's three HTTP histograms, otelpgx's
+  `db_client_operation_duration_seconds` (free once a meter provider
+  existed), `go_*` and `process_*`.
+- Pool gauges per pool (`otelpgx.RecordStats`), named `write` / `read`:
+  both pools point at the same `host:port/db`, otelpgx's default name, and
+  their series would collide.
+- Relay on `:9101`: events published (counted after commit), events failed,
+  batch duration (non-empty batches only; buckets 1 ms to 30 s), outbox
+  backlog and oldest-event age (read from Postgres per scrape).
+- `loadrun.sh` prints Prometheus's p50/p95/p99 for the measured window under
+  k6's table.
+
+**Free metrics, predicted vs read from `/metrics`:**
+
+| Question                      | Predicted                      | Actual                                                    |
+| ----------------------------- | ------------------------------ | --------------------------------------------------------- |
+| what appears without code     | `http.server.request.duration` | 3 otelhttp histograms + otelpgx DB durations + go/process |
+| `/metrics` counted as a route | yes                            | **no**: otelhttp wraps each route, not the mux            |
+
+**Relay, single events after a restart** (`sum ÷ count` of the batch
+histogram): first batch **687 ms**; the next 5 averaged **42.8 ms**. Cold
+start confirmed; 42.8 ms for one event is above Day 26's ~21 ms per
+100-event batch, cause not measured (JVM warm-up, throttling, fresh VM).
+
+**metrics-1** (`dbaaa7b+dirty`, the relay commit before rebasing onto #41/#42:
+otelhttp 0.71, franz-go 1.22.0; 2 min, `UNIT_RATE=200`, CPU_Speed_Limit
+**20% at start and end**): **invalid as a measurement** (406 dropped
+iterations, k6 at its 500-VU limit), valid for the k6-vs-Prometheus
+comparison (both see the same requests).
+
+| ms                 | k6 (client, exact) | Prometheus (server, buckets) | Δ          | bucket of the value |
+| ------------------ | ------------------ | ---------------------------- | ---------- | ------------------- |
+| POST p50           | 235.32             | 239.39                       | +1.7%      | 100–250 ms          |
+| POST p95           | 2,206.45           | 2,367.95                     | +7.3%      | 1–2.5 s             |
+| POST p99           | 3,610.83           | 4,362.66                     | **+20.8%** | 2.5–5 s             |
+| GET bookings p50   | 24.54              | 23.99                        | −2.2%      | 10–25 ms            |
+| GET bookings p95   | 2,270.72           | 2,411.80                     | +6.2%      | 1–2.5 s             |
+| GET bookings p99   | 3,541.33           | 4,418.41                     | **+24.8%** | 2.5–5 s             |
+| GET units p50      | 23.54              | 23.39                        | −0.6%      | 10–25 ms            |
+| GET units p95      | 2,131.56           | 2,251.14                     | +5.6%      | 1–2.5 s             |
+| GET units p99      | 3,450.64           | 4,236.55                     | **+22.8%** | 2.5–5 s             |
+| POST count         | 5,990              | 6,337                        | +5.8%      | incl. 200 setup     |
+| GET bookings count | 3,001              | 3,095                        | +3.1%      |                     |
+| GET units count    | 23,606             | 24,349                       | +3.1%      | no setup requests   |
+
+Same run: unit cache hit rate 76.3% (14,072 / 4,380), **5,762 reads fell
+back to Postgres**; write pool 50: 24,760 acquires, 16.6% found no idle
+connection, 0 new, **988,995 ms waiting** (≈ 8.2 requests waiting on
+average); outbox lag p50 640.4 / p95 1,534.2 / p99 2,114.5 / max 3,478.6 ms
+over 7,716 events (6 unpublished).
+
+**Observations:**
+
+- **The dashboard's error follows the bucket width, not the traffic:**
+  under 2% at p50, 6–7% at p95 (a 1.5 s bucket), **21–25% at p99** (a 2.5 s
+  bucket). Linear interpolation assumes requests spread evenly over the
+  bucket; they cluster at its low end, so the estimate is high.
+- **Server-side vs client-side shows only at p50, and only just:** both GET
+  p50s are 0.15–0.55 ms lower on the dashboard (network + HTTP parsing on
+  localhost). In the tail, buckets dominate.
+- **Counts are estimates too:** `increase()` extrapolates to the window's
+  edges, +3% on a route with no setup requests.
+- **k6 stays the source of the numbers in this file; the dashboard shows
+  shape and timing** (when it degrades, which saturation signal moves first).
+- **At 20% CPU everything degraded together:** POST p50 235 ms (Day 26
+  healthy: 27–28), Redis timeouts (5,762 fallbacks at 50 ms), pool waits,
+  lag ×2, and k6 itself ran out of VUs.
+- **An absent counter is not a zero:** `failed_total` has no series until
+  its first increment, so a panel shows No data. `or vector(0)` and
+  `or ... * 0` in the queries; verified with a forced 5xx in a scratch run.
+
+**Open:**
+
+- Bucket edges where the tail is (an OTel View on
+  `http.server.request.duration`) if the dashboard's p99 must be exact
+- Consumer metrics and Kafka consumer lag (cut today for time)
+- Relay batch errors (e.g. Postgres down) are logged, not counted; only the
+  backlog age shows them
+- Alert rules (backlog age rising, `up == 0`, 5xx share)
+- The breaking-point run (Days 28–29): a cool Mac (`CPU_Speed_Limit 100`),
+  and k6's 500-VU limit raised or watched
+- Docker Desktop upgrade before k8s (Days 30–31), recorded as its own change

@@ -2,15 +2,18 @@
 //
 // Configuration (environment, with local defaults):
 //
-//	DATABASE_URL   postgres://loka:loka@localhost:5432/loka?sslmode=disable
-//	KAFKA_BROKERS  localhost:9092 (comma-separated)
-//	KAFKA_TOPIC    booking-events
+//	DATABASE_URL        postgres://loka:loka@localhost:5432/loka?sslmode=disable
+//	KAFKA_BROKERS       localhost:9092 (comma-separated)
+//	KAFKA_TOPIC         booking-events
+//	RELAY_METRICS_ADDR  :9101 (GET /metrics, for Prometheus to scrape)
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
 
 	"github.com/nicholaswijaya004/loka/internal/relay"
 	"github.com/nicholaswijaya004/loka/internal/storage"
@@ -60,6 +64,7 @@ func run() error {
 	dsn := envOr("DATABASE_URL", "postgres://loka:loka@localhost:5432/loka?sslmode=disable")
 	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	topic := envOr("KAFKA_TOPIC", "booking-events")
+	metricsAddr := envOr("RELAY_METRICS_ADDR", ":9101")
 
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -90,11 +95,14 @@ func run() error {
 	}
 	defer client.Close()
 
-	r := relay.New(
-		storage.NewStore(pool),
-		relay.NewKafkaPublisher(client, topic),
-		batchSize, pollInterval, logger,
-	)
+	store := storage.NewStore(pool)
+	r := relay.New(store, relay.NewKafkaPublisher(client, topic), batchSize, pollInterval, logger)
+
+	if err := relay.RegisterBacklogMetrics(store, otel.GetMeterProvider()); err != nil {
+		return fmt.Errorf("backlog metrics: %w", err)
+	}
+	stopMetrics := serveMetrics(metricsAddr, logger)
+	defer stopMetrics()
 
 	if os.Getenv("CRASH_AFTER_PUBLISH") == "1" {
 		r.SetAfterPublish(func() {
@@ -107,6 +115,28 @@ func run() error {
 	err = r.Run(ctx)
 	logger.Info("relay stopped")
 	return err
+}
+
+// serveMetrics serves GET /metrics on addr in the background and returns a
+// function that stops it. If the port is taken, the relay keeps publishing
+// unscraped: losing its metrics is better than losing its events.
+func serveMetrics(addr string, logger *slog.Logger) (stop func()) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", telemetry.MetricsHandler())
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server failed, relay continues without it", "addr", addr, "error", err)
+		}
+	}()
+	logger.Info("serving metrics", "addr", addr)
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Error("metrics server shutdown failed", "error", err)
+		}
+	}
 }
 
 func envOr(key, fallback string) string {
