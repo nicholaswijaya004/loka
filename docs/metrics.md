@@ -1956,3 +1956,63 @@ over 7,716 events (6 unpublished).
 - The breaking-point run (Days 28–29): a cool Mac (`CPU_Speed_Limit 100`),
   and k6's 500-VU limit raised or watched
 - Docker Desktop upgrade before k8s (Days 30–31), recorded as its own change
+
+## Day 29
+
+**Goal:** 3 API replicas behind a load balancer; rerun the contention test to
+show the invariant holds across instances (plan Day 38).
+
+**Settings:**
+
+| Setting   | Value                                                                                                 | Why                                                       |
+| --------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| replicas  | 3 × `cmd/api` in containers (`Dockerfile`, `docker-compose.replicas.yml`), nginx round-robin on :8088 | only the API is replicated; correctness lives in Postgres |
+| pools     | `API_DB_MAX_CONNS=20` per replica: 3 × (20 + 10 read) = 90 of `max_connections` 100                   | 3 × the default 60 = 180 would exceed Postgres's limit    |
+| tests     | `contention.js` (500 VUs, 1 POST each, 10-seat unit) and `retry.js` (500 VUs, one key)                | Days 3–11's tests, unchanged                              |
+| control   | `UNSAFE_DECREMENT=1`: the decrement computed in Go                                                    | proves the setup can detect an oversell                   |
+| valid run | no k6 `bookings_error` (status 0 or 5xx)                                                              | status 0 passes the scripts' `< 500` check                |
+| machine   | Day 27's: Docker VM 8 CPUs, 3.84 GiB                                                                  |                                                           |
+
+**Results** (`scripts/replicas.sh`, n = 1 each):
+
+| Run          | Bookings | Invariant                          | 201s per replica (api-1/2/3) | Requests per replica | Retries |
+| ------------ | -------- | ---------------------------------- | ---------------------------- | -------------------- | ------- |
+| single       | 10       | 0 + 10 = 10 ✓                      | 2 / 4 / 4                    | 163 / 169 / 168      | 0       |
+| forupdate    | 10       | 0 + 10 = 10 ✓                      | 3 / 2 / 5                    | 166 / 168 / 166      | 0       |
+| optimistic   | 10       | 0 + 10 = 10 ✓                      | 4 / 2 / 4                    | 167 / 165 / 168      | 1,924   |
+| serializable | 10       | 0 + 10 = 10 ✓                      | 1 / 6 / 3                    | 170 / 167 / 163      | 326     |
+| **unsafe**   | **500**  | **7 + 500 = 507 ✗ (oversold 497)** | 168 / 168 / 164              | 168 / 168 / 164      | 0       |
+| retry.js     | **1**    | 9 + 1 = 10 ✓                       | 0 / 1 / 0                    | 165 / 166 / 169      | 0       |
+
+retry.js responses: 1 × 201, **170 × 200 (replay)**, 329 × 409 (in progress).
+Day 3, one instance: 1 × 201, 0 replays, 499 × 409.
+
+**Observations:**
+
+- **The invariant held on all 4 strategies with every replica winning
+  seats.** The guarantee is Postgres's (row lock on the decrement, `CHECK`,
+  `FOR UPDATE`, version check, `40001`): 3 processes are 3 clients.
+- **The control oversold by 497 through the same setup**, so the test can
+  see a violation; 10 in the safe runs is evidence, not luck.
+- **Idempotency held across processes: one booking from 500 copies of a
+  key.** The unique index on `idempotency_keys` decides, not a process.
+  More replays than Day 3 (170 vs 0): the burst took longer through 3
+  replicas, so the winner had finished before part of it arrived. Both
+  answers are correct.
+- **Retries:** serializable 326 vs Day 11's 334 on one instance (n = 1 each,
+  older setup): no difference shown. Optimistic 1,924 (~190 per booking) has
+  no single-instance baseline at 10 seats (Day 10's table is `[TODO]`).
+- **Round-robin spread requests within 160–170 per replica.**
+- **First run lost 244 of 500 requests at nginx (EOF)**, a scratch run
+  before the real ones: `worker_connections` defaults to 512 and counts
+  client and upstream connections. Raised to 4,096. The scripts' `< 500`
+  check passed those requests (status 0); `replicas.sh` now marks such a
+  run invalid.
+
+**Open:**
+
+- Replicating the workers (relay, payments, consumers): `SKIP LOCKED` and
+  consumer groups should share the work; not measured
+- PgBouncer instead of shrinking pools per replica
+- Latency per strategy with replicas vs one instance (same machine, n ≥ 3)
+- k8s manifests + HPA (dropped from the plan for time)
