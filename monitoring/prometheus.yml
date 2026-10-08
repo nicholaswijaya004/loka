@@ -1,0 +1,16 @@
+# Prometheus pulls GET /metrics from each Loka process. The processes run on
+# the Mac (make run, go run ./cmd/relay, scripts/loadrun.sh), not in compose,
+# so the targets are the host as a container sees it.
+global:
+  # 5 s, not the usual 15 s: a load run lasts a few minutes, and Grafana's
+  # $__rate_interval needs at least four samples per window.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+  - job_name: relay
+    static_configs:
+      - targets: ['host.docker.internal:9101']

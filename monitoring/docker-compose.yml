@@ -1,0 +1,44 @@
+# Prometheus and Grafana, kept out of the main compose file on purpose:
+# `make reset` (which every scripts/loadrun.sh run calls) does
+# `docker compose down -v` there, and would wipe the metrics history with it.
+# As a separate project, one dashboard can show several runs side by side.
+#
+#   make monitoring-up     Prometheus on :9090, Grafana on :3000
+#   make monitoring-down   stop both (the history stays in the volume)
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    ports:
+      - '3000:3000'
+    environment:
+      # Local only: no login, everyone is admin.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  promdata:

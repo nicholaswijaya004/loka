@@ -61,3 +61,11 @@ test-integration:
 vet:
 	go vet ./...
 	go vet -tags=integration ./...
+
+# Prometheus (:9090) and Grafana (:3000) as their own compose project, so
+# `make reset` doesn't wipe the metrics history. See monitoring/docker-compose.yml.
+monitoring-up:
+	docker compose -p loka-monitoring -f monitoring/docker-compose.yml up -d
+
+monitoring-down:
+	docker compose -p loka-monitoring -f monitoring/docker-compose.yml down
