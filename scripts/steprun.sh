@@ -12,6 +12,10 @@
 # The script stops after the first broken step; the rest would only break
 # harder and heat the Mac.
 #
+# The Mac throttles its CPU when hot (pmset's CPU_Speed_Limit < 100). Before
+# each step the script waits, up to COOL_WAIT_MIN minutes, for it to read 100
+# again; a step that throttled while it ran is marked so, not trusted.
+#
 # Output: one loadruns/<LABEL>-x<m>-<RUN>/ per step (loadrun.sh's files) and
 # loadruns/<LABEL>-<RUN>-summary.txt with one row per step.
 
@@ -23,7 +27,8 @@ STEPS="${STEPS:-1 2 4 6 8 10 12}"
 DURATION="${DURATION:-60s}"
 P99_LIMIT_MS="${P99_LIMIT_MS:-1000}"
 FAIL_LIMIT_PCT="${FAIL_LIMIT_PCT:-1}"
-REQUIRE_COOL="${REQUIRE_COOL:-1}" # 1 = refuse to start a step while the CPU is throttled
+REQUIRE_COOL="${REQUIRE_COOL:-1}"   # 1 = start a step only at CPU_Speed_Limit 100
+COOL_WAIT_MIN="${COOL_WAIT_MIN:-20}" # how long to wait for that before giving up
 LOADRUN="${LOADRUN:-./scripts/loadrun.sh}"
 BIN_DIR="bin/$LABEL"
 SUMMARY="loadruns/${LABEL}-${RUN}-summary.txt"
@@ -39,8 +44,8 @@ if [[ -e "$SUMMARY" ]]; then
   exit 1
 fi
 mkdir -p loadruns
-printf '%-7s %8s %8s %9s %9s %9s %7s %7s %10s %9s %8s %5s  %s\n' \
-  step offered achieved post_p50 post_p99 unit_p99 fail% drop% pool_wait lag_p99 pending cpu verdict | tee "$SUMMARY"
+printf '%-7s %8s %8s %9s %9s %9s %7s %7s %10s %9s %8s %7s  %s\n' \
+  step offered achieved post_p50 post_p99 unit_p99 fail% drop% pool_wait lag_p99 pending cpu'%' verdict | tee "$SUMMARY"
 
 build=1
 for m in $STEPS; do
@@ -50,8 +55,18 @@ for m in $STEPS; do
 
   speed=$(cpu_speed_limit)
   if [[ "$REQUIRE_COOL" == 1 && "$speed" -lt 100 ]]; then
-    echo "CPU_Speed_Limit is $speed (throttled) before step x$m; stopping. Let the Mac cool, or REQUIRE_COOL=0." | tee -a "$SUMMARY" >&2
-    exit 1
+    echo "==> CPU_Speed_Limit $speed before step x$m; waiting up to $COOL_WAIT_MIN min for 100"
+    waited=0
+    while [[ "$speed" -lt 100 ]]; do
+      if ((waited >= COOL_WAIT_MIN * 60)); then
+        echo "x$m: still throttled ($speed) after $COOL_WAIT_MIN min; stopping." | tee -a "$SUMMARY" >&2
+        exit 1
+      fi
+      sleep 15
+      waited=$((waited + 15))
+      speed=$(cpu_speed_limit)
+    done
+    echo "==> cool again after ${waited} s"
   fi
 
   echo "==> Step x$m: $offered req/s offered (POST $rate, GET booking $get_rate, GET unit $unit_rate)"
@@ -88,6 +103,8 @@ for m in $STEPS; do
   pool_wait=$(sed -nE 's/.* ([0-9]+) ms waiting in total.*/\1/p' "$dir/k6.txt" | tail -1)
   lag_p99=$(sed -nE 's/^outbox lag \(ms\):.* p99 ([0-9.]+) .*/\1/p' "$dir/k6.txt" | tail -1)
   pending=$(awk '$1 == "pending" || $1 == "payment_pending" { s += $3 } END { print s + 0 }' "$dir/db-state.txt")
+  speed_end=$(sed -n 's/^cpu_speed_limit_end=//p' "$dir/settings.txt")
+  speed_end="${speed_end:-$speed}"
 
   verdict=$(awk -v p99="$post_p99" -v reqs="$reqs" -v failed="$failed" -v iters="$iters" -v dropped="$dropped" \
     -v plim="$P99_LIMIT_MS" -v flim="$FAIL_LIMIT_PCT" 'BEGIN {
@@ -99,12 +116,15 @@ for m in $STEPS; do
       if (dpct > flim) why = why "drop>" flim "% "
       printf "%.2f %.2f %s", fpct, dpct, (why == "" ? "ok" : "BROKEN: " why) }')
   read -r fail_pct drop_pct verdict_text <<<"$verdict"
+  if [[ "$speed_end" != n/a && "$speed_end" -lt 100 ]]; then
+    verdict_text="$verdict_text (THROTTLED during the step: not valid)"
+  fi
 
-  printf '%-7s %8s %8.0f %9.1f %9.1f %9.1f %7s %7s %10s %9s %8s %5s  %s\n' \
+  printf '%-7s %8s %8.0f %9.1f %9.1f %9.1f %7s %7s %10s %9s %8s %7s  %s\n' \
     "x$m" "$offered" "$achieved" "$post_p50" "$post_p99" "$unit_p99" "$fail_pct" "$drop_pct" \
-    "${pool_wait:--}" "${lag_p99:--}" "$pending" "$speed" "$verdict_text" | tee -a "$SUMMARY"
+    "${pool_wait:--}" "${lag_p99:--}" "$pending" "$speed/$speed_end" "$verdict_text" | tee -a "$SUMMARY"
 
-  if [[ "$verdict_text" != ok ]]; then
+  if [[ "$verdict_text" == BROKEN* ]]; then
     echo "==> x$m broke; stopping. Per-step files: loadruns/${LABEL}-x*-${RUN}/" | tee -a "$SUMMARY"
     exit 0
   fi
