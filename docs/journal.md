@@ -2153,3 +2153,74 @@ reset, and losing metrics shouldn't stop the relay from publishing.
 - Tail-accurate buckets; consumer metrics and Kafka lag; alert rules
 - The breaking-point run on a cool Mac (tomorrow)
 - Docker Desktop upgrade before k8s
+
+## Day 29
+
+### What I built
+
+- **The API as a container image** (`Dockerfile`) and **3 replicas behind
+  nginx** (`docker-compose.replicas.yml`, `deploy/nginx.conf`).
+- **`scripts/replicas.sh`**: reset, build, 3 replicas, k6 through nginx, then
+  the invariant, the requests per replica and the retries.
+- **Who wrote what:** Claude wrote the files and checked them against 3 local
+  API processes behind a real nginx; I ran every replica run.
+
+### Prediction before measuring
+
+- Bookings with 3 replicas: **10. Right**, on all 4 strategies; the unsafe
+  control oversold by 497.
+- Retries: **more. Not shown**: serializable 326 vs 334 on one instance;
+  optimistic has no one-instance number to compare.
+- Spread: **~167 each. Right** (160–170).
+
+### What happened
+
+- Every replica won some of the 10 seats, and the 11th request was refused
+  wherever it landed.
+- The same setup with the decrement in Go sold 500 seats out of 10.
+- 500 copies of one idempotency key made one booking; this time 170 of the
+  losers got the stored response instead of "in progress".
+
+### What I understand now
+
+**Correctness has to live where every instance meets.** Row locks, `CHECK`,
+unique indexes and `SERIALIZABLE` are in Postgres, so 3 API processes are
+just 3 clients. A `sync.Mutex`, an in-memory idempotency map or a local cache
+would each work on one instance and break on three.
+
+**A test needs a control.** "10 bookings" only means something because the
+unsafe version, on the same setup, gives 500.
+
+**Pools are sized for the fleet, not the instance.** 3 × 60 connections is
+180 against a limit of 100; per-replica pools shrink, or PgBouncer goes in
+front.
+
+**A load balancer has limits of its own.** nginx's 512 connections per
+worker count both sides; past that it closes connections silently.
+
+**A "passing" check can hide lost requests.** Status 0 is below 500.
+
+### Things that went wrong
+
+- Nothing on my side today; the long breaking-point attempt earlier is
+  parked until the Mac is cool.
+- Claude's mistakes, caught before they reached my machine:
+  - nginx's default connection limit (244 of 500 requests lost in the
+    scratch run);
+  - `declare -A` and `logs --since` in the first draft of the script, which
+    my bash 3.2 and Compose v2.2.3 would have rejected.
+
+### Questions I should be able to answer
+
+- Why did 3 replicas still give exactly 10 bookings?
+- What design would work on 1 instance and break on 3?
+- What makes only one of 500 identical requests create a booking, across
+  processes?
+- Why did more of the losers get a replay on 3 replicas than on 1?
+- Why `API_DB_MAX_CONNS=20` with 3 replicas?
+- Why run the unsafe version at all?
+- Why doesn't nginx retry a failed POST on another replica?
+
+### Still open
+
+- Replicated workers; PgBouncer; latency with replicas, n ≥ 3; k8s + HPA
