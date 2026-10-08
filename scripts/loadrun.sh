@@ -41,6 +41,7 @@ UNIT_CACHE_TTL="${UNIT_CACHE_TTL:-30s}" # 0 = unit cache off, same binaries
 UNIT_CACHE_TIMEOUT="${UNIT_CACHE_TIMEOUT:-50ms}" # Redis read/write timeout in the API
 API_DB_MAX_CONNS="${API_DB_MAX_CONNS:-50}"       # API write pool size
 GOMAXPROCS_API="${GOMAXPROCS_API:-}"             # threads running Go code in the API; empty = all CPUs
+PROM_URL="${PROM_URL:-http://localhost:9090}"   # skipped if nothing answers there
 OUT="loadruns/${LABEL}-${RUN}"
 BINARIES=(paymock api relay payments notifier cacheinvalidator)
 
@@ -205,12 +206,14 @@ fi
 # between these two snapshots is the measured window alone.
 curl -sf localhost:8080/debug/pool >"$OUT/pool-before.json"
 measure_start=$(psql_loka -tA -c "SELECT clock_timestamp()")
+measure_start_epoch=$(date +%s)
 
 echo "==> Measured run ($DURATION)"
 k6_status=0
 k6 run -q -e DURATION="$DURATION" -e SUMMARY_FILE="$OUT/k6-summary.json" scripts/k6/load.js \
   2>&1 | tee "$OUT/k6.txt" || k6_status=$?
 curl -sf localhost:8080/debug/pool >"$OUT/pool-after.json"
+measure_end_epoch=$(date +%s)
 
 if [[ "$MONITOR" == 1 ]]; then
   wait "$PROBE_PID" || true
@@ -276,6 +279,37 @@ read -r lag_n lag_p50 lag_p95 lag_p99 lag_max lag_unpub <<< "$(psql_loka -tA -F'
   FROM outbox_events
   WHERE created_at >= '$measure_start'")"
 echo "outbox lag (ms): p50 $lag_p50 p95 $lag_p95 p99 $lag_p99 max $lag_max over $lag_n events ($lag_unpub unpublished)" | tee -a "$OUT/k6.txt"
+
+# The same window as Prometheus saw it, next to k6's table: server-side
+# durations (from the handler's start to its end, no network, no client
+# queueing) estimated from histogram buckets, against k6's exact client-side
+# ones. The window also holds k6's setup requests, which k6's table leaves out.
+if curl -sf "$PROM_URL/-/ready" >/dev/null 2>&1; then
+  sleep 6 # one more scrape after the run, so its last seconds are in
+  at=$((measure_end_epoch + 5))
+  window="$((at - measure_start_epoch))s"
+  promq() {
+    curl -sfG "$PROM_URL/api/v1/query" --data-urlencode "query=$1" --data-urlencode "time=$at" |
+      jq -r '.data.result[0].value[1] // "NaN"' || echo NaN
+  }
+  {
+    printf '\n%-20s%10s%10s%10s%10s\n' 'prometheus (ms)' p50 p95 p99 count
+    for r in 'POST /bookings' 'GET /bookings/{id}' 'GET /units/{id}'; do
+      sel="job=\"api\", http_request_method=\"${r%% *}\", http_route=\"${r#* }\""
+      vals=()
+      for q in 0.5 0.95 0.99; do
+        vals+=("$(promq "histogram_quantile($q, sum by (le) (increase(http_server_request_duration_seconds_bucket{$sel}[$window])))")")
+      done
+      n=$(promq "sum(increase(http_server_request_duration_seconds_count{$sel}[$window]))")
+      # No samples comes back as NaN; print "-", not a misleading 0.
+      awk -v r="$r" -v a="${vals[0]}" -v b="${vals[1]}" -v c="${vals[2]}" -v n="$n" '
+        function ms(x) { return x == "NaN" ? "-" : sprintf("%.2f", x * 1000) }
+        BEGIN { printf "%-20s%10s%10s%10s%10s\n", r, ms(a), ms(b), ms(c), (n == "NaN" ? "-" : sprintf("%.0f", n)) }'
+    done
+  } | tee -a "$OUT/k6.txt"
+else
+  echo "prometheus: not reachable at $PROM_URL, skipped (make monitoring-up)" | tee -a "$OUT/k6.txt"
+fi
 
 speed_end=$(cpu_speed_limit)
 echo "cpu_speed_limit_end=$speed_end" >>"$OUT/settings.txt"
