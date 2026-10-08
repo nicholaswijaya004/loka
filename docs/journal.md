@@ -2048,3 +2048,108 @@ in 7 minutes; the full-stack runs gave mostly overlap.
 - Poison rows and events (attempt cap, dead letter); per-booking order
 - Pools for 3 replicas; GOMAXPROCS in containers
 - Measuring on a cool Mac or on Linux
+
+## Day 27
+
+### What I built
+
+- **A `/metrics` endpoint on the API and the relay**, scraped by Prometheus.
+- **A Grafana dashboard for the four golden signals**, provisioned from a
+  JSON file in the repo, in its own compose project so `make reset` doesn't
+  wipe its history.
+- **`loadrun.sh` now prints the dashboard's p50/p95/p99** under k6's table
+  for the same window.
+- **Who wrote what:** I applied the telemetry setup, the `/metrics` route and
+  the pool metrics, and ran every check and run. To save time Claude wrote
+  the relay metrics and their tests, the monitoring stack, the dashboard and
+  the loadrun step.
+
+### Prediction before measuring
+
+- Free metrics: "only `http.server.request.duration`". **Wrong:** three
+  otelhttp histograms, plus otelpgx's DB durations, plus go/process metrics.
+- `/metrics` counted as a route: "yes". **Wrong:** otelhttp wraps each
+  route, not the mux.
+- p99 of 300 ms with buckets 250 / 500: "between 250 and 500". **Right.**
+  "The dashboard shows ~490": **wrong**, it interpolates (375 in the worked
+  example).
+- Averaging three replicas' p99s: "no, you need the bucket counts". **Right.**
+- Raw path as a label: "180,000 paths, ~3 million series, Prometheus runs
+  out of memory". **Right** (and the API's own memory grows too).
+- Relay batch after the cold start: Claude said "a few ms". **Measured
+  42.8 ms.**
+- Dashboard vs k6: **not written.**
+
+### What happened
+
+- Docker's memory change didn't apply the first time, and the engine went
+  down twice afterwards.
+- All the free metrics appeared once a meter provider existed.
+- In the load run the Mac was throttled to 20% and everything degraded, but
+  k6 and Prometheus still measured the same requests: p50 matched within 2%,
+  p99 was 21–25% high on the dashboard.
+
+### What I understand now
+
+**Pull vs push is about who starts the transfer.** Pull: the receiver asks
+and controls the pace (Prometheus, Kafka consumers, the relay's poll).
+Push: the sender sends right away (OTLP traces, LISTEN/NOTIFY). Robust
+systems push a hint and pull the data.
+
+**Golden signals: traffic, latency, errors, saturation.** RED for services,
+USE for resources. Saturation is whatever queues up first: here the DB pool
+and the outbox backlog.
+
+**A histogram can only say which bucket a percentile is in.**
+`histogram_quantile` interpolates inside it, so the error follows the
+bucket's width: 2% at p50, 25% at p99 today.
+
+**Never average percentiles.** Sum the bucket counts across instances, then
+take the quantile.
+
+**Labels must be bounded.** Every label combination is its own time series;
+IDs belong in traces and logs.
+
+**An absent series is not zero.** A counter that never moved has no data,
+so the query has to say what "nothing" means.
+
+**Count after the commit.** A rolled-back batch is sent again; counting it
+earlier counts it twice.
+
+**Monitoring is a separate system.** Its history shouldn't die with the app's
+reset, and losing metrics shouldn't stop the relay from publishing.
+
+### Things that went wrong
+
+- I clicked away from Docker's settings without Apply & Restart.
+- Docker created a **folder** called `prometheus.yml` because the file
+  didn't exist yet when I started the stack.
+- goimports in Neovim removed the new import before the code used it.
+- The machine was throttled again (20%); the run counts only for the
+  comparison.
+- No predictions for the Block 5 comparison.
+- Claude's mistakes:
+  - guessing a stray old `docker` binary (it was Docker Desktop itself);
+  - a first rollback test that passed with the bug in place;
+  - a 10 s top bucket just under the 10 s Kafka timeout, so those batches
+    landed in +Inf (found in a real run, fixed with 15 and 30 s);
+  - predicting "a few ms" for a batch that took 42.8 ms.
+
+### Questions I should be able to answer
+
+- Pull vs push: who controls the rate, who must know whose address, what
+  happens when the other side is down?
+- The four golden signals for the API and the pipeline: which metric each?
+- Why is the dashboard's p99 25% high when p50 is within 2%?
+- Why can't you average three replicas' p99s, and what do you do instead?
+- What does a raw path label do to Prometheus and to the API?
+- Why does `failed_total` show No data, and how do you fix the query?
+- Why count published events after the commit, and why skip empty polls?
+- Why does the backlog use `max`, not `sum`, across relay replicas?
+- Why run monitoring as its own compose project?
+
+### Still open
+
+- Tail-accurate buckets; consumer metrics and Kafka lag; alert rules
+- The breaking-point run on a cool Mac (tomorrow)
+- Docker Desktop upgrade before k8s
