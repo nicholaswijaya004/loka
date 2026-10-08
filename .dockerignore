@@ -1,0 +1,7 @@
+.git
+bin/
+loadruns/
+monitoring/
+docs/
+*.log
+/api
