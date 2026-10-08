@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/nicholaswijaya004/loka/internal/api"
 	"github.com/nicholaswijaya004/loka/internal/booking"
@@ -123,6 +124,18 @@ func main() {
 		os.Exit(1)
 	}
 	defer readPool.Close()
+
+	// Pool stats as metrics, read when Prometheus scrapes (at most once a
+	// second). Both pools point at the same host:port/db, which is otelpgx's
+	// default pool name, so name them or their series collide.
+	for name, p := range map[string]*pgxpool.Pool{"write": pool, "read": readPool} {
+		if err := otelpgx.RecordStats(p, otelpgx.WithStatsAttributes(
+			attribute.String("db.client.connection.pool.name", name),
+		)); err != nil {
+			logger.Error("pool metrics setup failed", "pool", name, "error", err)
+			os.Exit(1)
+		}
+	}
 
 	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelPing()
@@ -238,6 +251,10 @@ func main() {
 			logger.Error("write failed", "path", r.URL.Path, "error", err)
 		}
 	})
+
+	// Not wrapped in otelhttp: Prometheus's own scrapes would show up as
+	// traffic on the dashboards they feed.
+	mux.Handle("GET /metrics", telemetry.MetricsHandler())
 
 	mux.HandleFunc("GET /debug/pool", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

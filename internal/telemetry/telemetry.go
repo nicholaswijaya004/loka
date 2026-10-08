@@ -2,13 +2,18 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -17,6 +22,10 @@ import (
 // after service, and sets the W3C traceparent propagator that carries a
 // trace between processes. Call shutdown before exiting, or spans still in
 // the buffer are lost.
+//
+// It also sets a meter provider whose metrics MetricsHandler serves for
+// Prometheus to scrape (pull): nothing is sent anywhere, so a process
+// without a /metrics route records them for no one.
 //
 // The endpoint comes from OTEL_EXPORTER_OTLP_ENDPOINT (default
 // localhost:4317). Spans are exported in the background: if the collector is
@@ -42,7 +51,28 @@ func Setup(ctx context.Context, service string, logger *slog.Logger) (shutdown f
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		logger.Error("opentelemetry", "error", err)
 	}))
-	return provider.Shutdown, nil
+
+	// Registers with Prometheus's default registry, which already holds the
+	// Go runtime (go_*) and process (process_*) collectors.
+	metricExporter, err := prometheus.New()
+	if err != nil {
+		return nil, fmt.Errorf("prometheus exporter: %w", err)
+	}
+	meterProvider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(metricExporter),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(meterProvider)
+
+	return func(ctx context.Context) error {
+		return errors.Join(provider.Shutdown(ctx), meterProvider.Shutdown(ctx))
+	}, nil
+}
+
+// MetricsHandler serves this process's metrics in the Prometheus text
+// format. Prometheus pulls them on its own schedule.
+func MetricsHandler() http.Handler {
+	return promhttp.Handler()
 }
 
 // Inject returns the propagation headers (traceparent, and any others the
