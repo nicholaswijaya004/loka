@@ -1898,7 +1898,8 @@ histogram): first batch **687 ms**; the next 5 averaged **42.8 ms**. Cold
 start confirmed; 42.8 ms for one event is above Day 26's ~21 ms per
 100-event batch, cause not measured (JVM warm-up, throttling, fresh VM).
 
-**metrics-1** (`dbaaa7b+dirty`, 2 min, `UNIT_RATE=200`, CPU_Speed_Limit
+**metrics-1** (`dbaaa7b+dirty`, the relay commit before rebasing onto #41/#42:
+otelhttp 0.71, franz-go 1.22.0; 2 min, `UNIT_RATE=200`, CPU_Speed_Limit
 **20% at start and end**): **invalid as a measurement** (406 dropped
 iterations, k6 at its 500-VU limit), valid for the k6-vs-Prometheus
 comparison (both see the same requests).
