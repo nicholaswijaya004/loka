@@ -2298,3 +2298,71 @@ one pod.
 
 - Requests without limits; scaling on backlog or p99; PgBouncer; workers on
   Kubernetes
+
+## Day 28 (run after Days 29–30)
+
+### What I built
+
+- **`scripts/steprun.sh`**: one `loadrun.sh` run per load step until a step
+  breaks, with a summary row per step; it waits for the Mac to cool and marks
+  throttled steps.
+- **Who wrote what:** Claude wrote the script; I set up a GitHub Codespace and
+  ran every step.
+
+### Prediction before measuring
+
+- Breaks at: **×10.** Measured: the edge at **×16** (1 of 3 runs over),
+  broken at ×20. Claude said ×8.
+- First signal: **API CPU and Postgres.** Measured: payments' backlog first
+  (×4), then the whole machine's CPU, showing up as pool waiting (×6). Claude
+  said pool waiting; that was the symptom, the CPU was the cause.
+- Shape: **p99 jumps while p50 stays flat.** Half right: p99 jumped early
+  (×4), but p50 also rose, and jumped 8× from ×16 to ×20.
+
+### What happened
+
+- On the Mac every attempt throttled within one or two steps; no valid
+  breaking point.
+- On a 4-vCPU codespace: healthy to ×14, the edge at ×16, broken at ×20.
+- Payments fell behind from ×4 without the API noticing.
+- The relay kept the outbox lag under 0.7 s at every step.
+
+### What I understand now
+
+**Little's law sets a worker's ceiling.** 10 in flight ÷ 0.1 s each = 100/s.
+Load above that only grows the backlog.
+
+**Asynchronous parts fail quietly.** Payments was the first thing past its
+limit, and no API metric moved. The pending count is the signal.
+
+**The queue shows up where the scarce thing is handed out, not where the
+shortage is.** The pool of 50 queued, but the CPU was full: a bigger pool
+wouldn't help.
+
+**Saturation is a cliff.** 25% more load, 8× the median.
+
+**At the edge, one run isn't enough.** ×16 passed, failed, passed.
+
+**The test machine has limits too.** The laptop throttled first; k6 shared
+the codespace's 4 vCPUs with Loka.
+
+### Things that went wrong
+
+- Hours of Mac runs lost to thermal throttling before moving to a codespace.
+- I re-pasted terminal output as commands once.
+- Claude's mistakes: a first `steprun.sh` that gave up on a hot Mac instead of
+  waiting for it to cool; one run per step at first, which made ×16 look safe.
+
+### Questions I should be able to answer
+
+- What's Loka's breaking point, on what machine, and how do you know?
+- What gave way first, and why didn't the API notice?
+- Why did the pool queue if the pool wasn't the cause?
+- Why does 25% more load give 8× the latency near saturation?
+- What would you change to go past ×16?
+- Why reset between steps, and what does that hide?
+- Why was the Mac result invalid?
+
+### Still open
+
+- Payments' throughput; k6 on another machine; a soak test
