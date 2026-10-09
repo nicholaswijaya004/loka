@@ -2091,3 +2091,85 @@ median **6.78 ms**, p95 **668 ms**, p99 **2.87 s**, max 3.5 s;
 - PgBouncer, so `maxReplicas` isn't set by `max_connections`
 - The workers (relay, payments, consumers) on Kubernetes; Postgres managed
 - Keep-alive load with a request-level balancer (an ingress or service mesh)
+
+## Day 28 (run after Days 29–30)
+
+**Goal:** raise the load until Loka breaks; say where and why (plan Days 34–35).
+
+**"Broken"** (decided before any run): POST p99 > 1 s, or failed > 1%, or
+dropped iterations > 1% (the offered load wasn't delivered).
+
+**Load:** Day 26's mix (POST : GET booking : GET unit = 2 : 1 : 4); step ×m is
+25m POST/s. Each step is its own `loadrun.sh` run (reset, seed, 15 s warm-up,
+60 s measured) via `scripts/steprun.sh`, which stops after the first broken
+step. Resetting gives every step the same start; it hides data growth and
+carry-over backlog (a soak test would show those).
+
+**First attempt: the MacBook (Intel, 16 threads, Docker VM 8 CPUs, 3.84 GiB).**
+Not usable as a breaking point: the CPU throttles within the first steps.
+
+| Run | Step | POST p99 | CPU_Speed_Limit start/end | Verdict                        |
+| --- | ---- | -------- | ------------------------- | ------------------------------ |
+| 1   | ×1   | 140.5 ms | 100 / not checked         | ok                             |
+| 1   | ×2   | 50.5 ms  | 100 / not checked         | ok                             |
+| 1   | ×4   | 962.9 ms | 100 / not checked         | ok, at the edge                |
+| 1   | ×6   | —        | 41 before start           | not run                        |
+| 4   | ×2   | 35.5 ms  | 100 / 64                  | throttled: not valid           |
+| 4   | ×4   | 1,208 ms | 100 / 27                  | broken, throttled: not valid   |
+
+`steprun.sh` now waits for `CPU_Speed_Limit` 100 before each step and marks a
+step that throttled while it ran. The laptop's own limit comes first.
+
+**Second attempt: GitHub Codespace** (4 vCPUs AMD EPYC 7763, 15 GB, Go 1.27.2,
+Docker 29.8; k6 on the same machine). CPU steal 0% in every `vmstat` sample.
+
+| Step | Req/s offered | Achieved | POST p50 | POST p99   | Unit p99 | Dropped | Pool waiting (avg waiters) | Lag p99 | Payments pending | Run   | Verdict  |
+| ---- | ------------- | -------- | -------- | ---------- | -------- | ------- | -------------------------- | ------- | ---------------- | ----- | -------- |
+| ×1   | 87            | 90       | 6.2      | 21.5       | 6.3      | 0       | 0                          | 518     | 0                | cs-1  | ok       |
+| ×2   | 175           | 177      | 7.4      | 30.8       | 7.8      | 0       | 0                          | 517     | 0                | cs-1  | ok       |
+| ×4   | 350           | 349      | 12.0     | 150.7      | 14.7     | 0       | 0                          | 548     | 954              | cs-1  | ok       |
+| ×6   | 525           | 523      | 15.4     | 337.6      | 17.5     | 0       | 7.7 s (0.13)               | 543     | 4,869            | cs-1  | ok       |
+| ×8   | 700           | 693      | 19.3     | 308.1      | 47.0     | 0       | 18.0 s (0.30)              | 567     | 8,886            | cs-1  | ok       |
+| ×10  | 875           | 863      | 25.4     | 420.1      | 45.7     | 0       | 97.9 s (1.6)               | 584     | 12,787           | cs-1  | ok       |
+| ×12  | 1,050         | 1,037    | 32.6     | 461.5      | 60.3     | 0       | 236 s (3.9)                | 593     | 16,828           | cs-1  | ok       |
+| ×12  | 1,050         | 1,037    | 33.0     | 465.3      | 115.7    | 0       | 273 s (4.5)                | 604     | 16,779           | cs-4  | ok       |
+| ×14  | 1,225         | 1,206    | 51.3     | 597.4      | 94.8     | 0.10%   | 879 s (14.7)               | 634     | 20,870           | cs-4  | ok       |
+| ×16  | 1,400         | 1,381    | 99.5     | 917.7      | 208.9    | 0.43%   | 2,680 s (44.7)             | 650     | 24,627           | cs-1  | ok       |
+| ×16  | 1,400         | 1,372    | 198.0    | **1,170.1**| 497.0    | 0.85%   | 5,189 s (86.5)             | 644     | 25,049           | cs-3  | broken   |
+| ×16  | 1,400         | 1,386    | 118.0    | 721.7      | 105.5    | 0.23%   | 2,615 s (43.6)             | 658     | 24,899           | cs-4  | ok       |
+| ×20  | 1,750         | 1,635    | **832.3**| **1,770.9**| 314.6    | **4.93%**| 17,530 s (292)            | 658     | 28,219           | cs-2  | broken   |
+
+Avg waiters = total pool wait ÷ 60 s (Little's law). ×20 detail: POST p95
+1,585 ms, max 1,892 ms; 92.6% of acquires found no idle connection; k6 hit its
+500-VU limit for POSTs; unit cache hit rate 93.2%.
+
+**Breaking point: about 1,400 req/s (400 POST/s)** on 4 vCPUs with the load
+generator on the same machine: 1 of 3 runs over the p99 limit at ×16, ×12–×14
+clearly under, ×20 broken on p99 and drops.
+
+**What gave way, in order:**
+
+1. **Payments, from ×4 (100 POST/s).** The worker runs 10 charges at once and
+   paymock takes 100 ms: at most 10 / 0.1 s = 100 charges/s (Little's law).
+   From the pending counts it managed roughly 70–90/s, less as load grew.
+   Asynchronous: the API never noticed; confirmations just fall further behind.
+2. **The CPU, from about ×4–×6:** idle fell to 2–9% in the loaded minutes,
+   system time 40–47% (networking: k6's connections, Docker NAT, TCP between
+   containers). One-minute samples; not aligned to each step's window.
+3. **The write pool, from ×6:** average waiters 0.13 → 3.9 (×12) → 45 (×16)
+   → 292 (×20). With the CPU full, each request holds its connection longer;
+   busy = rate × hold time passes 50. The pool is where the queue forms, not
+   the cause: a bigger pool has no CPU to run more transactions.
+4. **The API, at ×16–×20:** p50 33 → 99–198 → 832 ms. 25% more load (×16 → ×20)
+   gave 8× the median: the queueing cliff.
+
+**What held:** the relay (outbox lag p99 517–658 ms at every step, 400 POST/s
+included); 0 failed requests at every step.
+
+**Open:**
+
+- Payments throughput: `MaxInFlight` 10 caps it at 100/s; more in flight, or
+  more workers (SKIP LOCKED lets them share), and its effect on paymock
+- k6 on a separate machine, so the API gets the 4 vCPUs
+- A soak test (one load for an hour): data growth, carry-over backlog
+- The Mac with Turbo Boost off: a stable clock instead of throttling
