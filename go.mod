@@ -3,7 +3,7 @@ module github.com/nicholaswijaya004/loka
 go 1.26.0
 
 require (
-	github.com/exaring/otelpgx v0.12.0
+	github.com/exaring/otelpgx v0.13.0
 	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
